@@ -1,37 +1,27 @@
-# RelaxFPS Friends Server v2
-
+RelaxFPS Friends Server v3
 Firebase yok. Bu küçük Node.js WebSocket sunucusu RelaxFPS Friends için çalışır.
-
-## Çalıştırma
-
+Özellikler
+RelaxFPS ID ile kayıt
+Online/offline presence
+Arkadaş isteği / kabul / reddetme
+Arkadaş listesini sunucudan eşitleme
+ID'den ID'ye mesaj iletimi
+Offline mesaj kuyruğu
+Sohbet geçmişi
+Okundu bildirimi
+Sesli/görüntülü arama için sinyal altyapısı
+Basit JSON dosyasına kayıt
+Çalıştırma
 ```bash
 npm install
 npm start
 ```
-
-Uygulamada yerel test adresi:
-
+Yerel test:
 ```text
 ws://BILGISAYAR_IP_ADRESIN:8080
 ```
-
-Örnek:
-
+Render kullanımı:
 ```text
-ws://192.168.1.35:8080
+wss://relaxfps-friends-server.onrender.com
 ```
-
-## v2 özellikleri
-
-- RelaxFPS ID ile kayıt
-- Online/offline presence
-- Arkadaş online durum sorgusu
-- ID'den ID'ye mesaj iletimi
-- Mesaj gönderildi / iletildi / sırada durumları
-- Sunucu açık kaldığı sürece offline mesaj kuyruğu
-- Firebase kullanmaz
-
-## İnternete açma
-
-Gerçek kullanıma almak için bu sunucuyu Render, Railway, VPS veya kendi domaininde yayınla.
-Uygulamada hedef adres `wss://...` olmalı.
+Not: Render Free plan uykuya geçebilir. Ücretli plana geçmeden de çalışır; sadece ilk bağlantı bazen yavaş uyanır.
