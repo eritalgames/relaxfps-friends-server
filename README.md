@@ -1,22 +1,32 @@
-RelaxFPS Friends Server v3.2
-Firebase yok. Bu Node.js WebSocket sunucusu RELAXFPS Friends ekranının sade sürümü için çalışır.
-Bu sürümde amaç
-Uygulamada kullanıcıya sunucu ayarı göstermeden sadece şu üç şeyi çalıştırmak:
-RELAXFPS ID ile arkadaş ekleme
-Arkadaşla yazılı mesajlaşma ve görsel paylaşma
-Sesli arama için WebRTC sinyal iletimi
-Özellikler
+RelaxFPS Friends Server v4
+Bu sürüm Firebase veya harici sohbet servisi kullanmadan RELAXFPS için kendi arkadaş sunucusu mantığını çalıştırır.
+Ana özellikler
 RelaxFPS ID ile kayıt
 Online/offline presence
-ID ile direkt arkadaş ekleme
-ID'den ID'ye metin mesajı
-Base64 görsel mesajı iletimi
+Arkadaş listesi
+Yazı mesajı
+Görsel mesajı
 Offline mesaj kuyruğu
 Sohbet geçmişi
-Okundu / iletildi bilgisi için temel altyapı
-Sesli arama için WebRTC offer/answer/candidate sinyal aktarımı
-Basit JSON dosyasına kayıt
-Render için `/health` kontrol adresi
+Okundu/teslim bilgisi
+Sesli arama sinyal aktarımı
+Kendi Relay Voice odaları
+Kendi Relay Voice mantığı
+WebRTC farklı internetlerde ses geçiremezse RELAXFPS kendi relay sistemini kullanabilir:
+```text
+Telefon A mikrofonu
+↓
+Konuşma şiddeti algılanır
+↓
+Sadece konuşulan kısımlar düşük kalite 8 kHz PCM paketlere küçültülür
+↓
+WebSocket ile RELAXFPS sunucusundaki özel odaya gelir
+↓
+Sunucu paketi online Arkadaş B’ye anlık yollar
+↓
+Arkadaş B paketi görünmez şekilde çalar
+```
+Bu sistem profesyonel WebRTC/TURN kalitesinde değildir, ama cihazdan cihaza doğrudan ses yolu bulamadığında kendi sunucumuz üzerinden çalışmak için tasarlanmıştır.
 Çalıştırma
 ```bash
 npm install
@@ -30,8 +40,4 @@ Render kullanımı:
 ```text
 wss://relaxfps-friends-server.onrender.com
 ```
-Not: Render Free plan uykuya geçebilir. Ücretli plana geçmeden çalışır; ilk bağlantı bazen birkaç saniye geç uyanır.
-Relay Voice Mode
-Farklı Wi‑Fi / mobil veri ağlarında WebRTC doğrudan ses taşıyamazsa uygulama Relay Voice Mode kullanabilir.
-Bu modda küçük PCM16 ses parçaları WebSocket üzerinden sunucuya gelir ve aynı odadaki arkadaşa aktarılır.
-İlk sürüm basılı tut konuş mantığıyla çalışır; Discord/telefon kalitesi hedeflenmez, amaç farklı ağlarda sesin mutlaka gitmesidir.
+Not: Render Free plan uykuya geçebilir. Kendi VPS kullanılırsa sunucu sürekli açık kalır ve Relay Voice daha stabil olur.
