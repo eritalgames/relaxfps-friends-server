@@ -12,7 +12,7 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '3.1.0',
+      version: '3.2.0',
       online: onlineIds().length,
       time: new Date().toISOString(),
     }));
@@ -357,4 +357,124 @@ wss.on('connection', (socket) => {
     if (type === 'message') {
       const from = normalizeId(data.from || currentId);
       const to = normalizeId(data.to);
-      const text = String
+      const kind = String(data.kind || 'text').trim().toLowerCase() === 'image' ? 'image' : 'text';
+      const text = String(data.text || '').trim().slice(0, 2000);
+      const imageBase64 = kind === 'image' ? String(data.imageBase64 || '').trim() : '';
+      const mimeType = kind === 'image' ? String(data.mimeType || 'image/jpeg').slice(0, 80) : '';
+      const fileName = kind === 'image' ? String(data.fileName || 'relaxfps-image.jpg').slice(0, 120) : '';
+      const messageId = String(data.messageId || `srv-${Date.now()}-${Math.floor(Math.random() * 99999)}`);
+
+      const validTextMessage = kind === 'text' && text.length > 0;
+      const validImageMessage = kind === 'image' && imageBase64.length > 0 && imageBase64.length <= 1300000;
+      if (!validId(from) || !validId(to) || (!validTextMessage && !validImageMessage)) {
+        return send(socket, { type: 'error', message: 'Invalid message payload', messageId });
+      }
+
+      ensureProfile(from, data.name || 'RelaxFPS User');
+      ensureProfile(to);
+      const payload = {
+        type: 'message',
+        from,
+        to,
+        kind,
+        text: validTextMessage ? text : (text || 'Image'),
+        imageBase64,
+        mimeType,
+        fileName,
+        messageId,
+        time: data.time || new Date().toISOString(),
+      };
+      storeMessage(payload);
+
+      if (isOnline(to)) {
+        sendTo(to, payload);
+        send(socket, { type: 'delivered', to, messageId, time: new Date().toISOString() });
+      } else {
+        const queue = offlineQueue.get(to) || [];
+        queue.push(payload);
+        offlineQueue.set(to, queue);
+        send(socket, { type: 'queued', to, messageId, time: new Date().toISOString() });
+      }
+
+      console.log(`[MESSAGE:${kind}] ${from} -> ${to}: ${kind === 'image' ? fileName : text}`);
+      return;
+    }
+
+    if (type === 'read') {
+      const from = normalizeId(data.from || currentId);
+      const to = normalizeId(data.to);
+      const messageId = String(data.messageId || '');
+      sendTo(to, { type: 'read', from, to, messageId, time: new Date().toISOString() });
+      return;
+    }
+
+    if (type === 'typing') {
+      const from = normalizeId(data.from || currentId);
+      const to = normalizeId(data.to);
+      sendTo(to, { type: 'typing', from, typing: data.typing === true });
+      return;
+    }
+
+    if (type === 'call_invite' || type === 'call_answer' || type === 'call_end' || type === 'call_signal') {
+      const from = normalizeId(data.from || currentId);
+      const to = normalizeId(data.to);
+      if (!validId(from) || !validId(to)) return;
+      sendTo(to, { ...data, from, to, time: data.time || new Date().toISOString() });
+      if (type === 'call_invite') send(socket, { type: 'call_ringing', to, mode: data.mode || 'voice' });
+      return;
+    }
+
+    if (type === 'ping') {
+      send(socket, { type: 'pong', time: new Date().toISOString(), onlineIds: onlineIds() });
+      return;
+    }
+
+    send(socket, { type: 'error', message: 'Unknown message type' });
+  });
+
+  socket.on('close', () => {
+    if (currentId) {
+      const wentOffline = removeClient(currentId, socket);
+      if (wentOffline) {
+        if (state.profiles[currentId]) {
+          state.profiles[currentId].lastSeen = new Date().toISOString();
+          saveStateSoon();
+        }
+        broadcastPresence(currentId, false);
+        console.log(`[DISCONNECT] ${currentId}`);
+      } else {
+        console.log(`[SOCKET CLOSED] ${currentId} (${socketsFor(currentId).size} socket(s) left)`);
+      }
+    }
+  });
+
+  socket.on('error', (error) => {
+    console.warn('[SOCKET ERROR]', error.message);
+  });
+});
+
+setInterval(() => {
+  for (const [id, sockets] of clients.entries()) {
+    for (const socket of Array.from(sockets)) {
+      if (socket.readyState !== WebSocket.OPEN) {
+        sockets.delete(socket);
+      }
+    }
+    if (sockets.size === 0) {
+      clients.delete(id);
+      broadcastPresence(id, false);
+    }
+  }
+}, 30000);
+
+function shutdown() {
+  saveStateNow();
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+httpServer.listen(PORT, () => {
+  console.log(`RelaxFPS Friends Server v3.2 running on ws://0.0.0.0:${PORT}`);
+});
