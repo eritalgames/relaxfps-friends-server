@@ -1,7 +1,7 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "2.0.0",
-  "description": "RelaxFPS Friends WebSocket server with presence, delivery and in-memory offline queue",
+  "version": "3.0.0",
+  "description": "RelaxFPS Friends WebSocket server with friend requests, presence, history, read receipts and call signaling",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
