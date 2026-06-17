@@ -1,7 +1,7 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "3.0.0",
-  "description": "RelaxFPS Friends WebSocket server with friend requests, presence, history, read receipts and call signaling",
+  "version": "3.1.0",
+  "description": "RelaxFPS Friends WebSocket server with multi-socket presence, friend sync, history, read receipts and call signaling",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
