@@ -31,3 +31,7 @@ Render kullanımı:
 wss://relaxfps-friends-server.onrender.com
 ```
 Not: Render Free plan uykuya geçebilir. Ücretli plana geçmeden çalışır; ilk bağlantı bazen birkaç saniye geç uyanır.
+Relay Voice Mode
+Farklı Wi‑Fi / mobil veri ağlarında WebRTC doğrudan ses taşıyamazsa uygulama Relay Voice Mode kullanabilir.
+Bu modda küçük PCM16 ses parçaları WebSocket üzerinden sunucuya gelir ve aynı odadaki arkadaşa aktarılır.
+İlk sürüm basılı tut konuş mantığıyla çalışır; Discord/telefon kalitesi hedeflenmez, amaç farklı ağlarda sesin mutlaka gitmesidir.
