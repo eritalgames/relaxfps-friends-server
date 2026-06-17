@@ -1,12 +1,31 @@
+const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 8080;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'relaxfps-friends-data.json');
-const wss = new WebSocket.Server({ port: PORT });
 
-const clients = new Map(); // RelaxFPS ID -> socket
+const httpServer = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      ok: true,
+      service: 'RelaxFPS Friends Server',
+      version: '3.1.0',
+      online: onlineIds().length,
+      time: new Date().toISOString(),
+    }));
+    return;
+  }
+
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('RELAXFPS Friends Server is running. Use WebSocket: wss://relaxfps-friends-server.onrender.com');
+});
+
+const wss = new WebSocket.Server({ server: httpServer });
+
+const clients = new Map(); // RelaxFPS ID -> Set<WebSocket>
 const offlineQueue = new Map(); // RelaxFPS ID -> queued payloads
 
 const state = {
@@ -30,13 +49,15 @@ function loadState() {
 let saveTimer = null;
 function saveStateSoon() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
-    } catch (error) {
-      console.warn('[STATE] Could not save data file:', error.message);
-    }
-  }, 300);
+  saveTimer = setTimeout(saveStateNow, 300);
+}
+
+function saveStateNow() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+  } catch (error) {
+    console.warn('[STATE] Could not save data file:', error.message);
+  }
 }
 
 function normalizeId(value) {
@@ -49,6 +70,36 @@ function validId(id) {
 
 function conversationKey(a, b) {
   return [normalizeId(a), normalizeId(b)].sort().join('__');
+}
+
+function socketsFor(id) {
+  return clients.get(normalizeId(id)) || new Set();
+}
+
+function isOnline(id) {
+  const sockets = clients.get(normalizeId(id));
+  return !!sockets && sockets.size > 0;
+}
+
+function addClient(id, socket) {
+  const clean = normalizeId(id);
+  const sockets = clients.get(clean) || new Set();
+  sockets.add(socket);
+  clients.set(clean, sockets);
+}
+
+function removeClient(id, socket) {
+  const clean = normalizeId(id);
+  const sockets = clients.get(clean);
+  if (!sockets) return true;
+
+  sockets.delete(socket);
+  if (sockets.size === 0) {
+    clients.delete(clean);
+    return true;
+  }
+
+  return false;
 }
 
 function ensureProfile(id, name = '') {
@@ -90,7 +141,15 @@ function send(socket, payload) {
 }
 
 function sendTo(id, payload) {
-  send(clients.get(normalizeId(id)), payload);
+  for (const socket of socketsFor(id)) {
+    send(socket, payload);
+  }
+}
+
+function sendFriendsListToId(id) {
+  for (const socket of socketsFor(id)) {
+    sendFriendsList(socket, normalizeId(id));
+  }
 }
 
 function onlineIds() {
@@ -106,7 +165,12 @@ function broadcastPresence(id, online) {
 
 function publicProfile(id) {
   const profile = state.profiles[id] || { id, name: 'Relax Friend' };
-  return { id, name: profile.name || 'Relax Friend', online: clients.has(id), lastSeen: profile.lastSeen || null };
+  return {
+    id,
+    name: profile.name || 'Relax Friend',
+    online: isOnline(id),
+    lastSeen: profile.lastSeen || null,
+  };
 }
 
 function sendFriendsList(socket, id) {
@@ -115,14 +179,23 @@ function sendFriendsList(socket, id) {
 }
 
 function flushQueue(id) {
-  const socket = clients.get(id);
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const sockets = Array.from(socketsFor(id)).filter((socket) => socket.readyState === WebSocket.OPEN);
+  if (!sockets.length) return;
+
   const queue = offlineQueue.get(id) || [];
   if (!queue.length) return;
+
   for (const payload of queue) {
-    send(socket, payload);
-    sendTo(payload.from, { type: 'delivered', to: id, messageId: payload.messageId, time: new Date().toISOString(), queued: true });
+    sendTo(id, payload);
+    sendTo(payload.from, {
+      type: 'delivered',
+      to: id,
+      messageId: payload.messageId,
+      time: new Date().toISOString(),
+      queued: true,
+    });
   }
+
   offlineQueue.delete(id);
   console.log(`[QUEUE FLUSHED] ${id}: ${queue.length} message(s)`);
 }
@@ -159,30 +232,63 @@ wss.on('connection', (socket) => {
     if (type === 'register') {
       const id = normalizeId(data.id);
       if (!validId(id)) return send(socket, { type: 'error', message: 'Invalid RelaxFPS ID' });
-      if (currentId && clients.get(currentId) === socket) {
-        clients.delete(currentId);
-        broadcastPresence(currentId, false);
+
+      if (currentId && currentId !== id) {
+        const wentOffline = removeClient(currentId, socket);
+        if (wentOffline) broadcastPresence(currentId, false);
       }
+
+      const wasOffline = !isOnline(id);
       currentId = id;
-      clients.set(id, socket);
+      addClient(id, socket);
       ensureProfile(id, data.name || 'RelaxFPS User');
-      send(socket, { type: 'registered', id, online: true, onlineIds: onlineIds(), profile: publicProfile(id) });
+
+      send(socket, {
+        type: 'registered',
+        id,
+        online: true,
+        onlineIds: onlineIds(),
+        profile: publicProfile(id),
+      });
       sendFriendsList(socket, id);
-      broadcastPresence(id, true);
+
+      if (wasOffline) broadcastPresence(id, true);
       flushQueue(id);
-      console.log(`[REGISTER] ${id}`);
+      console.log(`[REGISTER] ${id} (${socketsFor(id).size} socket(s))`);
       return;
     }
 
     if (type === 'status') {
       const ids = Array.isArray(data.ids) ? data.ids.map(normalizeId) : [];
-      send(socket, { type: 'status', onlineIds: ids.filter((id) => clients.has(id)), allOnlineIds: onlineIds() });
+      send(socket, { type: 'status', onlineIds: ids.filter((id) => isOnline(id)), allOnlineIds: onlineIds() });
       return;
     }
 
     if (type === 'friends_list') {
       const id = normalizeId(data.id || currentId);
       if (validId(id)) sendFriendsList(socket, id);
+      return;
+    }
+
+    if (type === 'friend_add') {
+      const from = normalizeId(data.from || currentId);
+      const to = normalizeId(data.to);
+      if (!validId(from) || !validId(to) || from === to) {
+        return send(socket, { type: 'error', message: 'Invalid friend add payload' });
+      }
+
+      ensureProfile(from, data.name || 'RelaxFPS User');
+      ensureProfile(to);
+      addFriendship(from, to);
+
+      send(socket, { type: 'friend_added', id: to, friend: publicProfile(to), time: new Date().toISOString() });
+      sendTo(to, { type: 'friend_added', id: from, from, friend: publicProfile(from), time: new Date().toISOString() });
+      sendFriendsListToId(from);
+      sendFriendsListToId(to);
+      broadcastPresence(from, true);
+      broadcastPresence(to, isOnline(to));
+
+      console.log(`[FRIEND ADD] ${from} <-> ${to}`);
       return;
     }
 
@@ -211,11 +317,10 @@ wss.on('connection', (socket) => {
         if (r.from === to && r.to === from && r.status === 'pending') r.status = 'accepted';
       }
       saveStateSoon();
-      send(socket, { type: 'friend_accepted', from: to, id: to, name: publicProfile(to).name });
-      sendTo(to, { type: 'friend_accepted', from, id: from, name: publicProfile(from).name });
-      sendFriendsList(socket, from);
-      const target = clients.get(to);
-      if (target) sendFriendsList(target, to);
+      send(socket, { type: 'friend_accepted', from: to, id: to, name: publicProfile(to).name, friend: publicProfile(to) });
+      sendTo(to, { type: 'friend_accepted', from, id: from, name: publicProfile(from).name, friend: publicProfile(from) });
+      sendFriendsListToId(from);
+      sendFriendsListToId(to);
       return;
     }
 
@@ -235,6 +340,8 @@ wss.on('connection', (socket) => {
       const to = normalizeId(data.to);
       removeFriendship(from, to);
       sendTo(to, { type: 'friend_removed', from });
+      sendFriendsListToId(from);
+      sendFriendsListToId(to);
       return;
     }
 
@@ -250,68 +357,4 @@ wss.on('connection', (socket) => {
     if (type === 'message') {
       const from = normalizeId(data.from || currentId);
       const to = normalizeId(data.to);
-      const text = String(data.text || '').trim().slice(0, 2000);
-      const messageId = String(data.messageId || `srv-${Date.now()}-${Math.floor(Math.random() * 99999)}`);
-      if (!validId(from) || !validId(to) || !text) return send(socket, { type: 'error', message: 'Invalid message payload', messageId });
-      const payload = { type: 'message', from, to, text, messageId, time: data.time || new Date().toISOString() };
-      storeMessage(payload);
-      const target = clients.get(to);
-      if (target && target.readyState === WebSocket.OPEN) {
-        send(target, payload);
-        send(socket, { type: 'delivered', to, messageId, time: new Date().toISOString() });
-      } else {
-        const queue = offlineQueue.get(to) || [];
-        queue.push(payload);
-        offlineQueue.set(to, queue);
-        send(socket, { type: 'queued', to, messageId, time: new Date().toISOString() });
-      }
-      console.log(`[MESSAGE] ${from} -> ${to}: ${text}`);
-      return;
-    }
-
-    if (type === 'read') {
-      const from = normalizeId(data.from || currentId);
-      const to = normalizeId(data.to);
-      const messageId = String(data.messageId || '');
-      sendTo(to, { type: 'read', from, to, messageId, time: new Date().toISOString() });
-      return;
-    }
-
-    if (type === 'typing') {
-      const from = normalizeId(data.from || currentId);
-      const to = normalizeId(data.to);
-      sendTo(to, { type: 'typing', from, typing: data.typing === true });
-      return;
-    }
-
-    if (type === 'call_invite' || type === 'call_answer' || type === 'call_end' || type === 'call_signal') {
-      const from = normalizeId(data.from || currentId);
-      const to = normalizeId(data.to);
-      if (!validId(from) || !validId(to)) return;
-      sendTo(to, { ...data, from, to, time: data.time || new Date().toISOString() });
-      if (type === 'call_invite') send(socket, { type: 'call_ringing', to, mode: data.mode || 'voice' });
-      return;
-    }
-
-    if (type === 'ping') {
-      send(socket, { type: 'pong', time: new Date().toISOString(), onlineIds: onlineIds() });
-      return;
-    }
-
-    send(socket, { type: 'error', message: 'Unknown message type' });
-  });
-
-  socket.on('close', () => {
-    if (currentId && clients.get(currentId) === socket) {
-      clients.delete(currentId);
-      if (state.profiles[currentId]) {
-        state.profiles[currentId].lastSeen = new Date().toISOString();
-        saveStateSoon();
-      }
-      broadcastPresence(currentId, false);
-      console.log(`[DISCONNECT] ${currentId}`);
-    }
-  });
-});
-
-console.log(`RelaxFPS Friends Server v3 running on ws://0.0.0.0:${PORT}`);
+      const text = String
