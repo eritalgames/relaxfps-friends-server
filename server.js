@@ -30,6 +30,43 @@ const offlineQueue = new Map(); // RelaxFPS ID -> queued payloads
 const relayRooms = new Map(); // room -> {members:Set<string>, lastActive:number, chunks:number}
 const ADMIN_PASSWORD = process.env.RELAXFPS_ADMIN_PASSWORD || '6a32beb1-0e30-83eb-bf71-be356cbd095a';
 
+function defaultAppSettings() {
+  return {
+    maintenanceMode: false,
+    maintenanceMessage: '',
+    maintenanceUntil: '',
+    friendsEnabled: true,
+    communityEnabled: false,
+    relaxBenchEnabled: true,
+    winsimEnabled: true,
+    gameHubEnabled: true,
+    appLockEnabled: true,
+    soundBoosterEnabled: true,
+    virtualRamEnabled: true,
+    overlayEnabled: true,
+    messagingEnabled: true,
+    imageSharingEnabled: true,
+    voiceCallEnabled: true,
+    relayVoiceEnabled: true,
+    forceUpdate: false,
+    latestVersion: '',
+    minimumVersion: '',
+    updateMessage: '',
+    playStoreUrl: '',
+    freeFriendMinutes: 10,
+    premiumFriendMinutes: 60,
+    appLockFailLimit: 3,
+    appLockLockMinutes: 10,
+    betaToolsEnabled: true,
+    adsEnabled: true,
+    telemetryEnabled: true,
+    updatedAt: '',
+  };
+}
+
+function normalizeAppSettings(value) {
+  return { ...defaultAppSettings(), ...(value && typeof value === 'object' ? value : {}) };
+}
 
 const state = {
   profiles: {}, // id -> {id,name,lastSeen}
@@ -42,16 +79,14 @@ const state = {
   developerMessages: [], // {id,to,title,body,time,read}
   premiumUsers: {}, // id -> {id,until,months,time}
   bannedUsers: {}, // id -> {id,reason,until,time}
-  appSettings: {
-    maintenanceMode: false,
-    maintenanceMessage: '',
-    friendsEnabled: true,
-    communityEnabled: false,
-    relaxBenchEnabled: true,
-    winsimEnabled: true,
-    gameHubEnabled: true,
-  },
+  appSettings: defaultAppSettings(),
+  crashReports: [], // {id,from,screen,error,stack,time}
+  clientEvents: [], // {id,from,event,meta,time}
+  testUsers: {}, // id -> {id,enabled,time}
+  userNotes: {}, // id -> {id,note,time}
+  backups: [], // {id,time,size,summary,data}
   adminAuditLog: [], // {action, detail, time}
+  adminSecurity: { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 },
 };
 
 function loadState() {
@@ -65,8 +100,14 @@ function loadState() {
       state.developerMessages = Array.isArray(state.developerMessages) ? state.developerMessages : [];
       state.premiumUsers = state.premiumUsers || {};
       state.bannedUsers = state.bannedUsers || {};
-      state.appSettings = state.appSettings || { maintenanceMode: false, maintenanceMessage: '', friendsEnabled: true, communityEnabled: false, relaxBenchEnabled: true, winsimEnabled: true, gameHubEnabled: true };
+      state.appSettings = normalizeAppSettings(state.appSettings);
+      state.crashReports = Array.isArray(state.crashReports) ? state.crashReports : [];
+      state.clientEvents = Array.isArray(state.clientEvents) ? state.clientEvents : [];
+      state.testUsers = state.testUsers || {};
+      state.userNotes = state.userNotes || {};
+      state.backups = Array.isArray(state.backups) ? state.backups : [];
       state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
+      state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -313,6 +354,30 @@ function publicAnnouncements() {
     }));
 }
 
+function safeFileSize(file) {
+  try { return fs.existsSync(file) ? fs.statSync(file).size : 0; } catch (_) { return 0; }
+}
+
+function buildAnalytics() {
+  const events = state.clientEvents || [];
+  const byEvent = {};
+  for (const item of events) {
+    const key = String(item.event || 'unknown');
+    byEvent[key] = (byEvent[key] || 0) + 1;
+  }
+  const last24h = events.filter((item) => item.time && Date.parse(item.time) > Date.now() - 24 * 60 * 60 * 1000).length;
+  return {
+    eventsTotal: events.length,
+    eventsLast24h: last24h,
+    crashTotal: (state.crashReports || []).length,
+    feedbackTotal: (state.feedback || []).length,
+    premiumTotal: Object.keys(state.premiumUsers || {}).length,
+    bannedTotal: Object.keys(state.bannedUsers || {}).length,
+    testUsersTotal: Object.keys(state.testUsers || {}).length,
+    byEvent,
+  };
+}
+
 function adminSnapshot() {
   const users = Object.keys(state.profiles || {}).sort().map((id) => ({
     id,
@@ -323,6 +388,11 @@ function adminSnapshot() {
     banned: !!isBanned(id),
     premium: !!isPremiumGranted(id),
     premiumUntil: isPremiumGranted(id)?.until || null,
+    testUser: !!(state.testUsers && state.testUsers[id]),
+    note: state.userNotes && state.userNotes[id] ? state.userNotes[id].note || '' : '',
+    appVersion: state.profiles[id]?.appVersion || '',
+    deviceModel: state.profiles[id]?.deviceModel || '',
+    language: state.profiles[id]?.language || '',
   }));
 
   const bannedUsers = Object.keys(state.bannedUsers || {}).map((id) => ({
@@ -342,14 +412,25 @@ function adminSnapshot() {
     customPanels: (state.customPanels || []).slice().reverse(),
     feedback: (state.feedback || []).slice().reverse(),
     developerMessages: (state.developerMessages || []).slice().reverse(),
-    appSettings: state.appSettings || {},
-    adminAuditLog: (state.adminAuditLog || []).slice().reverse().slice(0, 120),
+    appSettings: normalizeAppSettings(state.appSettings),
+    crashReports: (state.crashReports || []).slice().reverse().slice(0, 120),
+    clientEvents: (state.clientEvents || []).slice().reverse().slice(0, 200),
+    testUsers: Object.keys(state.testUsers || {}).map((id) => ({ id, ...(state.testUsers[id] || {}) })),
+    userNotes: Object.keys(state.userNotes || {}).map((id) => ({ id, ...(state.userNotes[id] || {}) })),
+    backups: (state.backups || []).map((b) => ({ id: b.id, time: b.time, size: b.size, summary: b.summary })).slice().reverse().slice(0, 20),
+    adminAuditLog: (state.adminAuditLog || []).slice().reverse().slice(0, 160),
+    adminSecurity: state.adminSecurity || {},
+    analytics: buildAnalytics(),
     systemHealth: {
       profiles: Object.keys(state.profiles || {}).length,
       friendships: Object.keys(state.friendships || {}).length,
       relayRooms: relayRooms.size,
       online: onlineIds().length,
+      messages: Object.values(state.messages || {}).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0),
       dataFile: DATA_FILE,
+      crashReports: (state.crashReports || []).length,
+      clientEvents: (state.clientEvents || []).length,
+      dataFileBytes: safeFileSize(DATA_FILE),
     },
     onlineIds: onlineIds(),
     time: new Date().toISOString(),
@@ -400,11 +481,22 @@ wss.on('connection', (socket) => {
       return;
     }
 
+    if (type === 'get_app_config') {
+      send(socket, { type: 'app_config', ok: true, requestId, settings: normalizeAppSettings(state.appSettings), time: new Date().toISOString() });
+      return;
+    }
+
     if (type === 'admin_login') {
+      state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
       if (String(data.password || '') === ADMIN_PASSWORD) {
         isAdmin = true;
-        send(socket, { type: 'admin_login', ok: true, requestId, time: new Date().toISOString() });
+        state.adminSecurity.wrongPasswordCount = 0;
+        adminAudit('admin_login', { ok: true });
+        send(socket, { type: 'admin_login', ok: true, requestId, time: new Date().toISOString(), sessionMinutes: state.adminSecurity.sessionMinutes || 60 });
       } else {
+        state.adminSecurity.wrongPasswordCount = Number(state.adminSecurity.wrongPasswordCount || 0) + 1;
+        state.adminSecurity.lastWrongPasswordAt = new Date().toISOString();
+        adminAudit('admin_login_failed', { count: state.adminSecurity.wrongPasswordCount });
         send(socket, { type: 'admin_login', ok: false, requestId, message: 'Invalid admin password' });
       }
       return;
@@ -512,15 +604,18 @@ wss.on('connection', (socket) => {
 
     if (type === 'admin_update_app_settings') {
       if (!requireAdmin(socket, isAdmin, requestId)) return;
-      state.appSettings = state.appSettings || {};
-      state.appSettings.maintenanceMode = data.maintenanceMode === true;
-      state.appSettings.maintenanceMessage = String(data.maintenanceMessage || '').slice(0, 800);
-      state.appSettings.friendsEnabled = data.friendsEnabled !== false;
-      state.appSettings.communityEnabled = data.communityEnabled === true;
-      state.appSettings.relaxBenchEnabled = data.relaxBenchEnabled !== false;
-      state.appSettings.winsimEnabled = data.winsimEnabled !== false;
-      state.appSettings.gameHubEnabled = data.gameHubEnabled !== false;
-      state.appSettings.updatedAt = new Date().toISOString();
+      const next = normalizeAppSettings(state.appSettings);
+      const boolKeys = ['maintenanceMode','friendsEnabled','communityEnabled','relaxBenchEnabled','winsimEnabled','gameHubEnabled','appLockEnabled','soundBoosterEnabled','virtualRamEnabled','overlayEnabled','messagingEnabled','imageSharingEnabled','voiceCallEnabled','relayVoiceEnabled','forceUpdate','betaToolsEnabled','adsEnabled','telemetryEnabled'];
+      for (const key of boolKeys) if (Object.prototype.hasOwnProperty.call(data, key)) next[key] = data[key] === true;
+      const textLimits = { maintenanceMessage: 1000, maintenanceUntil: 80, latestVersion: 40, minimumVersion: 40, updateMessage: 1000, playStoreUrl: 600 };
+      for (const [key, limit] of Object.entries(textLimits)) if (Object.prototype.hasOwnProperty.call(data, key)) next[key] = String(data[key] || '').slice(0, limit);
+      const numberKeys = { freeFriendMinutes: [0, 1440], premiumFriendMinutes: [0, 1440], appLockFailLimit: [1, 20], appLockLockMinutes: [1, 1440] };
+      for (const [key, range] of Object.entries(numberKeys)) if (Object.prototype.hasOwnProperty.call(data, key)) {
+        const value = Number(data[key]);
+        next[key] = Number.isFinite(value) ? Math.max(range[0], Math.min(value, range[1])) : next[key];
+      }
+      next.updatedAt = new Date().toISOString();
+      state.appSettings = next;
       adminAudit('update_app_settings', state.appSettings);
       saveStateSoon();
       for (const id of onlineIds()) sendTo(id, { type: 'app_settings', settings: state.appSettings });
@@ -598,8 +693,14 @@ wss.on('connection', (socket) => {
       const id = normalizeId(data.id);
       if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
       state.bannedUsers = state.bannedUsers || {};
-      state.appSettings = state.appSettings || { maintenanceMode: false, maintenanceMessage: '', friendsEnabled: true, communityEnabled: false, relaxBenchEnabled: true, winsimEnabled: true, gameHubEnabled: true };
+      state.appSettings = normalizeAppSettings(state.appSettings);
+      state.crashReports = Array.isArray(state.crashReports) ? state.crashReports : [];
+      state.clientEvents = Array.isArray(state.clientEvents) ? state.clientEvents : [];
+      state.testUsers = state.testUsers || {};
+      state.userNotes = state.userNotes || {};
+      state.backups = Array.isArray(state.backups) ? state.backups : [];
       state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
+      state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
       if (data.banned === true) {
         const minutes = Math.max(0, Math.min(Number(data.minutes || 0), 525600));
         const until = minutes > 0 ? new Date(Date.now() + minutes * 60 * 1000).toISOString() : null;
@@ -612,6 +713,116 @@ wss.on('connection', (socket) => {
       adminAudit('set_ban', { id, banned: data.banned === true });
       saveStateSoon();
       send(socket, { type: 'admin_set_ban', ok: true, requestId, id, banned: data.banned === true });
+      return;
+    }
+
+    if (type === 'admin_set_test_user') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const id = normalizeId(data.id);
+      if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
+      state.testUsers = state.testUsers || {};
+      if (data.enabled === true) state.testUsers[id] = { id, enabled: true, time: new Date().toISOString() }; else delete state.testUsers[id];
+      adminAudit('set_test_user', { id, enabled: data.enabled === true });
+      saveStateSoon();
+      sendTo(id, { type: 'test_user_status', enabled: data.enabled === true });
+      send(socket, { type: 'admin_set_test_user', ok: true, requestId, id, enabled: data.enabled === true });
+      return;
+    }
+
+    if (type === 'admin_set_user_note') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const id = normalizeId(data.id);
+      if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
+      state.userNotes = state.userNotes || {};
+      const note = String(data.note || '').slice(0, 2000);
+      if (note) state.userNotes[id] = { id, note, time: new Date().toISOString() }; else delete state.userNotes[id];
+      adminAudit('set_user_note', { id, hasNote: !!note });
+      saveStateSoon();
+      send(socket, { type: 'admin_set_user_note', ok: true, requestId, id, note });
+      return;
+    }
+
+    if (type === 'admin_backup_now') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      saveStateNow();
+      const snapshot = JSON.parse(JSON.stringify(state));
+      delete snapshot.backups;
+      const dataText = JSON.stringify(snapshot);
+      const backup = {
+        id: `backup-${Date.now()}`,
+        time: new Date().toISOString(),
+        size: dataText.length,
+        summary: { users: Object.keys(state.profiles || {}).length, announcements: (state.announcements || []).length, panels: (state.customPanels || []).length },
+        data: snapshot,
+      };
+      state.backups = state.backups || [];
+      state.backups.push(backup);
+      if (state.backups.length > 10) state.backups = state.backups.slice(-10);
+      adminAudit('backup_now', { id: backup.id, size: backup.size });
+      saveStateSoon();
+      send(socket, { type: 'admin_backup_now', ok: true, requestId, backup: { id: backup.id, time: backup.time, size: backup.size, summary: backup.summary } });
+      return;
+    }
+
+    if (type === 'admin_clear_admin_log') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      state.adminAuditLog = [];
+      adminAudit('clear_admin_log', {});
+      saveStateSoon();
+      send(socket, { type: 'admin_clear_admin_log', ok: true, requestId });
+      return;
+    }
+
+    if (type === 'admin_clear_crash_reports') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      state.crashReports = [];
+      adminAudit('clear_crash_reports', {});
+      saveStateSoon();
+      send(socket, { type: 'admin_clear_crash_reports', ok: true, requestId });
+      return;
+    }
+
+    if (type === 'admin_update_security') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      state.adminSecurity = state.adminSecurity || {};
+      const minutes = Math.max(5, Math.min(Number(data.sessionMinutes || 60), 1440));
+      state.adminSecurity.sessionMinutes = minutes;
+      state.adminSecurity.updatedAt = new Date().toISOString();
+      adminAudit('update_security', { sessionMinutes: minutes });
+      saveStateSoon();
+      send(socket, { type: 'admin_update_security', ok: true, requestId, adminSecurity: state.adminSecurity });
+      return;
+    }
+
+    if (type === 'client_event') {
+      const from = normalizeId(data.from || currentId);
+      if (state.appSettings && state.appSettings.telemetryEnabled === false) return send(socket, { type: 'client_event_saved', ok: false, requestId, disabled: true });
+      const item = { id: `evt-${Date.now()}-${Math.floor(Math.random() * 99999)}`, from: validId(from) ? from : 'UNKNOWN', event: String(data.event || 'unknown').slice(0, 120), meta: data.meta || {}, time: new Date().toISOString() };
+      state.clientEvents = state.clientEvents || [];
+      state.clientEvents.push(item);
+      if (state.clientEvents.length > 4000) state.clientEvents = state.clientEvents.slice(-4000);
+      saveStateSoon();
+      send(socket, { type: 'client_event_saved', ok: true, requestId, id: item.id });
+      return;
+    }
+
+    if (type === 'crash_report') {
+      const from = normalizeId(data.from || currentId);
+      const item = {
+        id: `crash-${Date.now()}-${Math.floor(Math.random() * 99999)}`,
+        from: validId(from) ? from : 'UNKNOWN',
+        screen: String(data.screen || '').slice(0, 160),
+        error: String(data.error || '').slice(0, 4000),
+        stack: String(data.stack || '').slice(0, 12000),
+        appVersion: String(data.appVersion || '').slice(0, 80),
+        deviceModel: String(data.deviceModel || '').slice(0, 120),
+        time: new Date().toISOString(),
+      };
+      state.crashReports = state.crashReports || [];
+      state.crashReports.push(item);
+      if (state.crashReports.length > 1000) state.crashReports = state.crashReports.slice(-1000);
+      saveStateSoon();
+      send(socket, { type: 'crash_report_saved', ok: true, requestId, id: item.id });
       return;
     }
 
