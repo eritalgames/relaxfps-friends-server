@@ -1,43 +1,22 @@
-RelaxFPS Friends Server v4
-Bu sürüm Firebase veya harici sohbet servisi kullanmadan RELAXFPS için kendi arkadaş sunucusu mantığını çalıştırır.
-Ana özellikler
-RelaxFPS ID ile kayıt
-Online/offline presence
-Arkadaş listesi
-Yazı mesajı
-Görsel mesajı
-Offline mesaj kuyruğu
-Sohbet geçmişi
-Okundu/teslim bilgisi
-Sesli arama sinyal aktarımı
-Kendi Relay Voice odaları
-Kendi Relay Voice mantığı
-WebRTC farklı internetlerde ses geçiremezse RELAXFPS kendi relay sistemini kullanabilir:
+RelaxFPS Friends Server - Admin Panel
+Bu sürümde WebSocket üzerinden çalışan geliştirici paneli altyapısı eklendi.
+Gizli panel girişi
+Uygulama içinde KMÜ görseline basılı tutup ardından görünür tepki olmadan 9 kez dokununca geliştirici giriş ekranı açılır.
+Admin şifresi
+Varsayılan şifre uygulamada değil, sunucu tarafında kontrol edilir.
+Render ortam değişkeni olarak ayarlaman önerilir:
 ```text
-Telefon A mikrofonu
-↓
-Konuşma şiddeti algılanır
-↓
-Sadece konuşulan kısımlar düşük kalite 8 kHz PCM paketlere küçültülür
-↓
-WebSocket ile RELAXFPS sunucusundaki özel odaya gelir
-↓
-Sunucu paketi online Arkadaş B’ye anlık yollar
-↓
-Arkadaş B paketi görünmez şekilde çalar
+RELAXFPS_ADMIN_PASSWORD=6a32beb1-0e30-83eb-bf71-be356cbd095a
 ```
-Bu sistem profesyonel WebRTC/TURN kalitesinde değildir, ama cihazdan cihaza doğrudan ses yolu bulamadığında kendi sunucumuz üzerinden çalışmak için tasarlanmıştır.
-Çalıştırma
-```bash
-npm install
-npm start
-```
-Yerel test:
-```text
-ws://BILGISAYAR_IP_ADRESIN:8080
-```
-Render kullanımı:
-```text
-wss://relaxfps-friends-server.onrender.com
-```
-Not: Render Free plan uykuya geçebilir. Kendi VPS kullanılırsa sunucu sürekli açık kalır ve Relay Voice daha stabil olur.
+Ortam değişkeni girilmezse server.js içindeki varsayılan şifre kullanılır.
+Panel özellikleri
+Kullanıcı listesi
+Online kullanıcı durumu
+Duyuru oluşturma
+Duyuru görseli ekleme
+Kullanıcıya geliştirici mesajı gönderme
+Ban / ban kaldırma
+Geri bildirim kayıt altyapısı
+Sunucu sağlık kontrolü
+Not
+Bu panel gerçek yönetim için sunucuya bağlı çalışır. Uygulama içindeki gizli hareket sadece giriş kapısıdır; asıl doğrulama sunucuda yapılır.
