@@ -36,9 +36,11 @@ const state = {
   friendships: {}, // id -> [friendId]
   friendRequests: [], // {from,to,name,time,status}
   messages: {}, // conversationKey -> message payloads
-  announcements: [], // {id,title,body,imageBase64,active,time}
+  announcements: [], // {id,title,body,imageBase64,videoBase64,link,buttonLabel,panelId,active,order,time}
+  customPanels: [], // {id,title,body,imageBase64,buttonLabel,buttonUrl,time}
   feedback: [], // {id,from,title,body,reply,status,time}
   developerMessages: [], // {id,to,title,body,time,read}
+  premiumUsers: {}, // id -> {id,until,months,time}
   bannedUsers: {}, // id -> {id,reason,until,time}
 };
 
@@ -47,6 +49,12 @@ function loadState() {
     if (fs.existsSync(DATA_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
       Object.assign(state, parsed);
+      state.announcements = Array.isArray(state.announcements) ? state.announcements : [];
+      state.customPanels = Array.isArray(state.customPanels) ? state.customPanels : [];
+      state.feedback = Array.isArray(state.feedback) ? state.feedback : [];
+      state.developerMessages = Array.isArray(state.developerMessages) ? state.developerMessages : [];
+      state.premiumUsers = state.premiumUsers || {};
+      state.bannedUsers = state.bannedUsers || {};
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -250,6 +258,42 @@ function isBanned(id) {
   return ban;
 }
 
+function isPremiumGranted(id) {
+  const clean = normalizeId(id);
+  const item = state.premiumUsers && state.premiumUsers[clean];
+  if (!item) return null;
+  if (item.until && Date.parse(item.until) <= Date.now()) {
+    delete state.premiumUsers[clean];
+    saveStateSoon();
+    return null;
+  }
+  return item;
+}
+
+function publicAnnouncements() {
+  return (state.announcements || [])
+    .filter((item) => item && item.active !== false)
+    .slice()
+    .sort((a, b) => (Number(a.order || 0) - Number(b.order || 0)) || String(b.time || '').localeCompare(String(a.time || '')))
+    .slice(0, 60)
+    .map((item) => ({
+      id: item.id,
+      title: item.title,
+      body: item.body,
+      category: item.category || 'Duyuru',
+      sourceName: item.sourceName || 'RELAXFPS',
+      link: item.link || '',
+      buttonLabel: item.buttonLabel || '',
+      buttonAction: item.buttonAction || '',
+      panelId: item.panelId || '',
+      imageBase64: item.imageBase64 || '',
+      videoBase64: item.videoBase64 || '',
+      active: item.active !== false,
+      order: Number(item.order || 0),
+      time: item.time,
+    }));
+}
+
 function adminSnapshot() {
   const users = Object.keys(state.profiles || {}).sort().map((id) => ({
     id,
@@ -258,6 +302,8 @@ function adminSnapshot() {
     online: isOnline(id),
     friendsCount: (state.friendships[id] || []).length,
     banned: !!isBanned(id),
+    premium: !!isPremiumGranted(id),
+    premiumUntil: isPremiumGranted(id)?.until || null,
   }));
 
   const bannedUsers = Object.keys(state.bannedUsers || {}).map((id) => ({
@@ -265,12 +311,16 @@ function adminSnapshot() {
     ...(state.bannedUsers[id] || {}),
   }));
 
+  const premiumUsers = Object.keys(state.premiumUsers || {}).map((id) => ({ id, ...(state.premiumUsers[id] || {}) }));
+
   return {
     type: 'admin_snapshot',
     ok: true,
     users,
     bannedUsers,
-    announcements: (state.announcements || []).slice().reverse(),
+    premiumUsers,
+    announcements: (state.announcements || []).slice().sort((a, b) => (Number(a.order || 0) - Number(b.order || 0)) || String(b.time || '').localeCompare(String(a.time || ''))),
+    customPanels: (state.customPanels || []).slice().reverse(),
     feedback: (state.feedback || []).slice().reverse(),
     developerMessages: (state.developerMessages || []).slice().reverse(),
     onlineIds: onlineIds(),
@@ -310,6 +360,18 @@ wss.on('connection', (socket) => {
     const type = String(data.type || '');
     const requestId = String(data.requestId || '');
 
+    if (type === 'get_public_announcements') {
+      send(socket, { type: 'public_announcements', ok: true, requestId, announcements: publicAnnouncements(), time: new Date().toISOString() });
+      return;
+    }
+
+    if (type === 'get_public_panel') {
+      const id = String(data.id || '').trim();
+      const panel = (state.customPanels || []).find((item) => item.id === id) || null;
+      send(socket, { type: 'public_panel', ok: !!panel, requestId, panel });
+      return;
+    }
+
     if (type === 'admin_login') {
       if (String(data.password || '') === ADMIN_PASSWORD) {
         isAdmin = true;
@@ -326,23 +388,88 @@ wss.on('connection', (socket) => {
       return;
     }
 
-    if (type === 'admin_create_announcement') {
+    if (type === 'admin_create_announcement' || type === 'admin_upsert_announcement') {
       if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const incomingId = String(data.id || '').trim();
+      const id = incomingId || `ann-${Date.now()}-${Math.floor(Math.random() * 99999)}`;
       const item = {
-        id: `ann-${Date.now()}-${Math.floor(Math.random() * 99999)}`,
-        title: String(data.title || '').slice(0, 120),
-        body: String(data.body || '').slice(0, 4000),
-        imageBase64: String(data.imageBase64 || '').slice(0, 1600000),
+        id,
+        title: String(data.title || '').slice(0, 160),
+        body: String(data.body || '').slice(0, 9000),
+        category: String(data.category || 'Duyuru').slice(0, 60),
+        sourceName: String(data.sourceName || 'RELAXFPS').slice(0, 80),
+        link: String(data.link || '').slice(0, 600),
+        buttonLabel: String(data.buttonLabel || '').slice(0, 80),
+        buttonAction: String(data.buttonAction || '').slice(0, 80),
+        panelId: String(data.panelId || '').slice(0, 120),
+        imageBase64: String(data.imageBase64 || '').slice(0, 2200000),
+        videoBase64: String(data.videoBase64 || '').slice(0, 2600000),
         active: data.active !== false,
-        time: new Date().toISOString(),
+        order: Number(data.order || 0),
+        time: incomingId ? ((state.announcements || []).find((x) => x.id === incomingId)?.time || new Date().toISOString()) : new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       };
       if (!item.title || !item.body) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Announcement title/body required' });
       state.announcements = state.announcements || [];
-      state.announcements.push(item);
-      if (state.announcements.length > 200) state.announcements = state.announcements.slice(-200);
+      const index = state.announcements.findIndex((x) => x.id === id);
+      if (index >= 0) state.announcements[index] = item; else state.announcements.push(item);
+      if (state.announcements.length > 300) state.announcements = state.announcements.slice(-300);
       saveStateSoon();
       for (const id of onlineIds()) sendTo(id, { type: 'announcement', item });
-      send(socket, { type: 'admin_create_announcement', ok: true, requestId, item });
+      send(socket, { type: 'admin_upsert_announcement', ok: true, requestId, item });
+      return;
+    }
+
+    if (type === 'admin_delete_announcement') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const id = String(data.id || '').trim();
+      state.announcements = (state.announcements || []).filter((item) => item.id !== id);
+      saveStateSoon();
+      send(socket, { type: 'admin_delete_announcement', ok: true, requestId, id });
+      return;
+    }
+
+    if (type === 'admin_upsert_custom_panel') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const incomingId = String(data.id || '').trim();
+      const safeBase = String(data.title || 'panel').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50) || 'panel';
+      const id = incomingId || `panel-${safeBase}-${Date.now()}`;
+      const panel = {
+        id,
+        title: String(data.title || '').slice(0, 160),
+        body: String(data.body || '').slice(0, 16000),
+        imageBase64: String(data.imageBase64 || '').slice(0, 2200000),
+        buttonLabel: String(data.buttonLabel || '').slice(0, 80),
+        buttonUrl: String(data.buttonUrl || '').slice(0, 600),
+        time: incomingId ? ((state.customPanels || []).find((x) => x.id === incomingId)?.time || new Date().toISOString()) : new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      if (!panel.title || !panel.body) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Panel title/body required' });
+      state.customPanels = state.customPanels || [];
+      const index = state.customPanels.findIndex((x) => x.id === id);
+      if (index >= 0) state.customPanels[index] = panel; else state.customPanels.push(panel);
+      if (state.customPanels.length > 200) state.customPanels = state.customPanels.slice(-200);
+      saveStateSoon();
+      send(socket, { type: 'admin_upsert_custom_panel', ok: true, requestId, panelId: id, panel });
+      return;
+    }
+
+    if (type === 'admin_set_premium') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const id = normalizeId(data.id);
+      if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
+      const months = Math.max(0, Math.min(Number(data.months || 0), 60));
+      state.premiumUsers = state.premiumUsers || {};
+      if (months <= 0) {
+        delete state.premiumUsers[id];
+        sendTo(id, { type: 'premium_removed', id, time: new Date().toISOString() });
+      } else {
+        const until = new Date(Date.now() + months * 30 * 24 * 60 * 60 * 1000).toISOString();
+        state.premiumUsers[id] = { id, months, until, time: new Date().toISOString(), source: 'developer_panel' };
+        sendTo(id, { type: 'premium_granted', grant: state.premiumUsers[id] });
+      }
+      saveStateSoon();
+      send(socket, { type: 'admin_set_premium', ok: true, requestId, id, premium: !!state.premiumUsers[id], grant: state.premiumUsers[id] || null });
       return;
     }
 
@@ -364,6 +491,28 @@ wss.on('connection', (socket) => {
       saveStateSoon();
       sendTo(to, { type: 'developer_message', ...item });
       send(socket, { type: 'admin_send_developer_message', ok: true, requestId, item });
+      return;
+    }
+
+
+    if (type === 'admin_send_bulk_developer_message') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const toAll = data.toAll === true;
+      const ids = Array.isArray(data.ids) ? data.ids.map(normalizeId).filter(validId) : [];
+      const targets = toAll ? Object.keys(state.profiles || {}) : Array.from(new Set(ids));
+      const title = String(data.title || 'Geliştiriciden mesajınız var').slice(0, 120);
+      const body = String(data.body || '').slice(0, 2500);
+      state.developerMessages = state.developerMessages || [];
+      const items = [];
+      for (const to of targets) {
+        const item = { id: `devmsg-${Date.now()}-${Math.floor(Math.random() * 99999)}`, to, title, body, time: new Date().toISOString(), read: false, bulk: true };
+        state.developerMessages.push(item);
+        items.push(item);
+        sendTo(to, { type: 'developer_message', ...item });
+      }
+      if (state.developerMessages.length > 2000) state.developerMessages = state.developerMessages.slice(-2000);
+      saveStateSoon();
+      send(socket, { type: 'admin_send_bulk_developer_message', ok: true, requestId, count: items.length });
       return;
     }
 
@@ -430,6 +579,7 @@ wss.on('connection', (socket) => {
         online: true,
         onlineIds: onlineIds(),
         profile: publicProfile(id),
+        premiumGrant: isPremiumGranted(id),
       });
       sendFriendsList(socket, id);
 
