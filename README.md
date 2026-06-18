@@ -1,28 +1,27 @@
-RelaxFPS Friends Server v4.2 Admin Studio
-Bu sürüm RELAXFPS arkadaş/duyuru/admin altyapısıdır.
-Ana özellikler
-RelaxFPS ID kayıt sistemi
-Online/offline presence
-Yazılı mesaj, görsel mesaj, geçmiş ve offline kuyruk
-Relay voice room altyapısı
-Developer/Admin Studio
-Duyuru oluşturma, düzenleme, silme ve sıralama
-Duyuruya görsel, video, kaynak linki, buton ve özel panel bağlama
-Özel panel oluşturma ve duyuru butonundan panele yönlendirme
-Kullanıcı listesi, ban yönetimi, premium süre tanımlama
-Tek ID veya toplu geliştirici mesajı gönderme
-Public announcement/panel endpointleri WebSocket üzerinden uygulamaya aktarılır
-Render ortam değişkeni
-Gerçek kullanımda admin şifresini Render Environment kısmına ekle:
-```text
-RELAXFPS_ADMIN_PASSWORD=6a32beb1-0e30-83eb-bf71-be356cbd095a
+Admin Studio v2 Genişletme
+Bu sürümde gizli geliştirici paneli uygulamayı uzaktan yönetmek için genişletildi.
+Yeni yönetim alanları:
+Uzaktan özellik aç/kapat: Friends, Community, RelaxBench, WinSimPro, Gaming Extreme, App Lock, Sound Booster, Virtual RAM, Overlay, mesajlaşma, görsel, sesli arama ve Relay Voice.
+Bakım modu: bakım mesajı ve tahmini bitiş notu.
+Zorunlu güncelleme: minimum sürüm, son sürüm, Play Store linki ve güncelleme mesajı.
+Kullanıcı yönetimi: premium süresi, ban, test kullanıcısı, kullanıcı notu, tek/toplu geliştirici mesajı.
+İçerik yönetimi: duyuru, görsel, video, kaynak linki, özel panel, buton aksiyonu.
+Hata raporları ve kullanım olayları: `crash_report` ve `client_event` mesaj tipleri.
+Yedekleme: admin panelinden JSON state yedeği oluşturma.
+Admin güvenliği: oturum süresi, hatalı giriş sayacı ve audit log.
+Yeni public komutlar:
+```json
+{ "type": "get_app_config" }
+{ "type": "client_event", "from": "RFX-...", "event": "tool_opened", "meta": {"tool":"RelaxBench"} }
+{ "type": "crash_report", "from": "RFX-...", "screen": "Tools", "error": "...", "stack": "..." }
 ```
-Çalıştırma
-```bash
-npm install
-npm start
-```
-Uygulama WebSocket adresi
-```text
-wss://relaxfps-friends-server.onrender.com
+Yeni admin komutları:
+```json
+admin_update_app_settings
+admin_set_test_user
+admin_set_user_note
+admin_backup_now
+admin_clear_admin_log
+admin_clear_crash_reports
+admin_update_security
 ```
