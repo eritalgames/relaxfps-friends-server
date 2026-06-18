@@ -42,6 +42,16 @@ const state = {
   developerMessages: [], // {id,to,title,body,time,read}
   premiumUsers: {}, // id -> {id,until,months,time}
   bannedUsers: {}, // id -> {id,reason,until,time}
+  appSettings: {
+    maintenanceMode: false,
+    maintenanceMessage: '',
+    friendsEnabled: true,
+    communityEnabled: false,
+    relaxBenchEnabled: true,
+    winsimEnabled: true,
+    gameHubEnabled: true,
+  },
+  adminAuditLog: [], // {action, detail, time}
 };
 
 function loadState() {
@@ -55,6 +65,8 @@ function loadState() {
       state.developerMessages = Array.isArray(state.developerMessages) ? state.developerMessages : [];
       state.premiumUsers = state.premiumUsers || {};
       state.bannedUsers = state.bannedUsers || {};
+      state.appSettings = state.appSettings || { maintenanceMode: false, maintenanceMessage: '', friendsEnabled: true, communityEnabled: false, relaxBenchEnabled: true, winsimEnabled: true, gameHubEnabled: true };
+      state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -65,6 +77,13 @@ let saveTimer = null;
 function saveStateSoon() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveStateNow, 300);
+}
+
+function adminAudit(action, detail = {}) {
+  state.adminAuditLog = state.adminAuditLog || [];
+  state.adminAuditLog.push({ action, detail, time: new Date().toISOString() });
+  if (state.adminAuditLog.length > 600) state.adminAuditLog = state.adminAuditLog.slice(-600);
+  saveStateSoon();
 }
 
 function saveStateNow() {
@@ -323,6 +342,15 @@ function adminSnapshot() {
     customPanels: (state.customPanels || []).slice().reverse(),
     feedback: (state.feedback || []).slice().reverse(),
     developerMessages: (state.developerMessages || []).slice().reverse(),
+    appSettings: state.appSettings || {},
+    adminAuditLog: (state.adminAuditLog || []).slice().reverse().slice(0, 120),
+    systemHealth: {
+      profiles: Object.keys(state.profiles || {}).length,
+      friendships: Object.keys(state.friendships || {}).length,
+      relayRooms: relayRooms.size,
+      online: onlineIds().length,
+      dataFile: DATA_FILE,
+    },
     onlineIds: onlineIds(),
     time: new Date().toISOString(),
   };
@@ -414,6 +442,7 @@ wss.on('connection', (socket) => {
       const index = state.announcements.findIndex((x) => x.id === id);
       if (index >= 0) state.announcements[index] = item; else state.announcements.push(item);
       if (state.announcements.length > 300) state.announcements = state.announcements.slice(-300);
+      adminAudit('upsert_announcement', { id, title: item.title, active: item.active });
       saveStateSoon();
       for (const id of onlineIds()) sendTo(id, { type: 'announcement', item });
       send(socket, { type: 'admin_upsert_announcement', ok: true, requestId, item });
@@ -424,6 +453,7 @@ wss.on('connection', (socket) => {
       if (!requireAdmin(socket, isAdmin, requestId)) return;
       const id = String(data.id || '').trim();
       state.announcements = (state.announcements || []).filter((item) => item.id !== id);
+      adminAudit('delete_announcement', { id });
       saveStateSoon();
       send(socket, { type: 'admin_delete_announcement', ok: true, requestId, id });
       return;
@@ -449,8 +479,52 @@ wss.on('connection', (socket) => {
       const index = state.customPanels.findIndex((x) => x.id === id);
       if (index >= 0) state.customPanels[index] = panel; else state.customPanels.push(panel);
       if (state.customPanels.length > 200) state.customPanels = state.customPanels.slice(-200);
+      adminAudit('upsert_custom_panel', { id, title: panel.title });
       saveStateSoon();
       send(socket, { type: 'admin_upsert_custom_panel', ok: true, requestId, panelId: id, panel });
+      return;
+    }
+
+    if (type === 'admin_delete_custom_panel') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const id = String(data.id || '').trim();
+      state.customPanels = (state.customPanels || []).filter((item) => item.id !== id);
+      adminAudit('delete_custom_panel', { id });
+      saveStateSoon();
+      send(socket, { type: 'admin_delete_custom_panel', ok: true, requestId, id });
+      return;
+    }
+
+    if (type === 'admin_update_feedback') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const id = String(data.id || '').trim();
+      const item = (state.feedback || []).find((fb) => fb.id === id);
+      if (!item) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Feedback not found' });
+      item.status = String(data.status || item.status || 'new').slice(0, 40);
+      item.reply = String(data.reply || '').slice(0, 2500);
+      item.updatedAt = new Date().toISOString();
+      adminAudit('update_feedback', { id, status: item.status });
+      saveStateSoon();
+      if (validId(item.from)) sendTo(item.from, { type: 'feedback_reply', item });
+      send(socket, { type: 'admin_update_feedback', ok: true, requestId, item });
+      return;
+    }
+
+    if (type === 'admin_update_app_settings') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      state.appSettings = state.appSettings || {};
+      state.appSettings.maintenanceMode = data.maintenanceMode === true;
+      state.appSettings.maintenanceMessage = String(data.maintenanceMessage || '').slice(0, 800);
+      state.appSettings.friendsEnabled = data.friendsEnabled !== false;
+      state.appSettings.communityEnabled = data.communityEnabled === true;
+      state.appSettings.relaxBenchEnabled = data.relaxBenchEnabled !== false;
+      state.appSettings.winsimEnabled = data.winsimEnabled !== false;
+      state.appSettings.gameHubEnabled = data.gameHubEnabled !== false;
+      state.appSettings.updatedAt = new Date().toISOString();
+      adminAudit('update_app_settings', state.appSettings);
+      saveStateSoon();
+      for (const id of onlineIds()) sendTo(id, { type: 'app_settings', settings: state.appSettings });
+      send(socket, { type: 'admin_update_app_settings', ok: true, requestId, appSettings: state.appSettings });
       return;
     }
 
@@ -468,6 +542,7 @@ wss.on('connection', (socket) => {
         state.premiumUsers[id] = { id, months, until, time: new Date().toISOString(), source: 'developer_panel' };
         sendTo(id, { type: 'premium_granted', grant: state.premiumUsers[id] });
       }
+      adminAudit('set_premium', { id, months });
       saveStateSoon();
       send(socket, { type: 'admin_set_premium', ok: true, requestId, id, premium: !!state.premiumUsers[id], grant: state.premiumUsers[id] || null });
       return;
@@ -488,6 +563,7 @@ wss.on('connection', (socket) => {
       state.developerMessages = state.developerMessages || [];
       state.developerMessages.push(item);
       if (state.developerMessages.length > 1000) state.developerMessages = state.developerMessages.slice(-1000);
+      adminAudit('send_developer_message', { to, title: item.title });
       saveStateSoon();
       sendTo(to, { type: 'developer_message', ...item });
       send(socket, { type: 'admin_send_developer_message', ok: true, requestId, item });
@@ -511,6 +587,7 @@ wss.on('connection', (socket) => {
         sendTo(to, { type: 'developer_message', ...item });
       }
       if (state.developerMessages.length > 2000) state.developerMessages = state.developerMessages.slice(-2000);
+      adminAudit('send_bulk_developer_message', { count: items.length, toAll });
       saveStateSoon();
       send(socket, { type: 'admin_send_bulk_developer_message', ok: true, requestId, count: items.length });
       return;
@@ -521,6 +598,8 @@ wss.on('connection', (socket) => {
       const id = normalizeId(data.id);
       if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
       state.bannedUsers = state.bannedUsers || {};
+      state.appSettings = state.appSettings || { maintenanceMode: false, maintenanceMessage: '', friendsEnabled: true, communityEnabled: false, relaxBenchEnabled: true, winsimEnabled: true, gameHubEnabled: true };
+      state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
       if (data.banned === true) {
         const minutes = Math.max(0, Math.min(Number(data.minutes || 0), 525600));
         const until = minutes > 0 ? new Date(Date.now() + minutes * 60 * 1000).toISOString() : null;
@@ -530,6 +609,7 @@ wss.on('connection', (socket) => {
         delete state.bannedUsers[id];
         sendTo(id, { type: 'ban_removed', id, time: new Date().toISOString() });
       }
+      adminAudit('set_ban', { id, banned: data.banned === true });
       saveStateSoon();
       send(socket, { type: 'admin_set_ban', ok: true, requestId, id, banned: data.banned === true });
       return;
