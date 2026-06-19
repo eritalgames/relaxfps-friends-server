@@ -44,3 +44,16 @@ RelaxBench genel cihaz sıralaması
 }
 ```
 Sunucu her RelaxFPS kimliği için son testi kalıcı state dosyasına kaydeder; genel sıra, kişisel sıra, önceki skor ve aynı model ortalaması döndürülür.
+v4.2 Günlük Ödül ve Promosyon Kodları
+Bu sürümde mağazadaki kod alanı ve günlük ödül sistemi için sunucu desteği eklendi.
+Public komut:
+```json
+{ "type": "redeem_promo_code", "requestId": "...", "id": "RFX-1234-5678", "code": "RELAX-1AY" }
+```
+Admin komutları:
+```json
+{ "type": "admin_upsert_promo_code", "code": "RELAX-1AY", "rewardType": "premium", "durationMinutes": 43200, "maxUses": 100, "active": true }
+{ "type": "admin_delete_promo_code", "code": "RELAX-1AY" }
+```
+Desteklenen ödül türleri: `premium`, `ad_free`, `winsim`, `friends_minutes`. Kodlar kullanıcı başına bir kez kullanılabilir; son kullanım tarihi ve toplam kullanım limiti belirlenebilir.
+Duyuru editörüne sabitleme, 0–100 öncelik ve isteğe bağlı bitiş tarihi alanları eklendi. Sabit ve yüksek öncelikli duyurular kullanıcı akışında önce gösterilir.
