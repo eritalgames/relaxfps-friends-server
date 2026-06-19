@@ -12,7 +12,7 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '4.1.0-admin',
+      version: '4.2.0-admin-rewards',
       online: onlineIds().length,
       time: new Date().toISOString(),
     }));
@@ -88,6 +88,7 @@ const state = {
   adminAuditLog: [], // {action, detail, time}
   adminSecurity: { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 },
   benchmarkScores: {}, // RelaxFPS ID -> latest persistent RelaxBench result
+  promoCodes: {}, // CODE -> reward definition and usage state
 };
 
 function loadState() {
@@ -111,6 +112,7 @@ function loadState() {
       state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
       state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
       state.benchmarkScores = state.benchmarkScores || {};
+      state.promoCodes = state.promoCodes || {};
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -334,10 +336,22 @@ function isPremiumGranted(id) {
 }
 
 function publicAnnouncements() {
+  const now = Date.now();
   return (state.announcements || [])
-    .filter((item) => item && item.active !== false)
+    .filter((item) => {
+      if (!item || item.active === false) return false;
+      if (!item.expiresAt) return true;
+      const expires = Date.parse(item.expiresAt);
+      return !Number.isFinite(expires) || expires > now;
+    })
     .slice()
-    .sort((a, b) => (Number(a.order || 0) - Number(b.order || 0)) || String(b.time || '').localeCompare(String(a.time || '')))
+    .sort((a, b) => {
+      const pinnedDiff = Number(b.pinned === true) - Number(a.pinned === true);
+      if (pinnedDiff !== 0) return pinnedDiff;
+      const priorityDiff = Number(b.priority || 0) - Number(a.priority || 0);
+      if (priorityDiff !== 0) return priorityDiff;
+      return (Number(a.order || 0) - Number(b.order || 0)) || String(b.time || '').localeCompare(String(a.time || ''));
+    })
     .slice(0, 60)
     .map((item) => ({
       id: item.id,
@@ -352,6 +366,9 @@ function publicAnnouncements() {
       imageBase64: item.imageBase64 || '',
       videoBase64: item.videoBase64 || '',
       active: item.active !== false,
+      pinned: item.pinned === true,
+      priority: Number(item.priority || 0),
+      expiresAt: item.expiresAt || '',
       order: Number(item.order || 0),
       time: item.time,
     }));
@@ -411,6 +428,7 @@ function adminSnapshot() {
     users,
     bannedUsers,
     premiumUsers,
+    promoCodes: Object.values(state.promoCodes || {}).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))),
     announcements: (state.announcements || []).slice().sort((a, b) => (Number(a.order || 0) - Number(b.order || 0)) || String(b.time || '').localeCompare(String(a.time || ''))),
     customPanels: (state.customPanels || []).slice().reverse(),
     feedback: (state.feedback || []).slice().reverse(),
@@ -433,6 +451,7 @@ function adminSnapshot() {
       dataFile: DATA_FILE,
       crashReports: (state.crashReports || []).length,
       clientEvents: (state.clientEvents || []).length,
+      promoCodes: Object.keys(state.promoCodes || {}).length,
       dataFileBytes: safeFileSize(DATA_FILE),
     },
     onlineIds: onlineIds(),
@@ -557,6 +576,78 @@ wss.on('connection', (socket) => {
       return;
     }
 
+    if (type === 'redeem_promo_code') {
+      const id = normalizeId(data.id || currentId);
+      const code = String(data.code || '').trim().toUpperCase().replace(/\s+/g, '');
+      if (!validId(id) || !code) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Geçerli RelaxFPS kimliği ve kod gerekli.' });
+        return;
+      }
+      state.promoCodes = state.promoCodes || {};
+      const item = state.promoCodes[code];
+      if (!item || item.active === false) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Kod geçersiz veya devre dışı.' });
+        return;
+      }
+      if (item.expiresAt && Date.parse(item.expiresAt) <= Date.now()) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Bu kodun süresi dolmuş.' });
+        return;
+      }
+      item.usedBy = Array.isArray(item.usedBy) ? item.usedBy : [];
+      if (item.usedBy.includes(id)) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Bu kodu daha önce kullandın.' });
+        return;
+      }
+      const maxUses = Math.max(0, Number(item.maxUses || 0));
+      if (maxUses > 0 && item.usedBy.length >= maxUses) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Kod kullanım sınırına ulaştı.' });
+        return;
+      }
+
+      const rewardType = String(item.rewardType || 'premium');
+      const durationMinutes = Math.max(1, Math.min(Number(item.durationMinutes || 60), 525600));
+      const totalMinutes = Math.max(10, Math.min(Number(item.totalMinutes || durationMinutes), 1440));
+      const reward = {
+        type: rewardType,
+        durationMinutes,
+        totalMinutes,
+        label: String(item.label || item.note || 'Promosyon ödülü').slice(0, 240),
+      };
+      let premiumGrant = null;
+      if (rewardType === 'premium') {
+        state.premiumUsers = state.premiumUsers || {};
+        const currentGrant = isPremiumGranted(id);
+        const currentUntilMs = currentGrant && currentGrant.until ? Date.parse(currentGrant.until) : 0;
+        const baseMs = Number.isFinite(currentUntilMs) && currentUntilMs > Date.now() ? currentUntilMs : Date.now();
+        const until = new Date(baseMs + durationMinutes * 60 * 1000).toISOString();
+        state.premiumUsers[id] = {
+          ...(currentGrant || {}),
+          id,
+          minutes: Number(currentGrant?.minutes || 0) + durationMinutes,
+          until,
+          time: new Date().toISOString(),
+          source: `promo:${code}`,
+        };
+        premiumGrant = state.premiumUsers[id];
+        sendTo(id, { type: 'premium_granted', grant: premiumGrant });
+      }
+      item.usedBy.push(id);
+      item.uses = item.usedBy.length;
+      item.updatedAt = new Date().toISOString();
+      adminAudit('promo_redeemed', { code, id, rewardType, durationMinutes, totalMinutes });
+      saveStateSoon();
+      send(socket, {
+        type: 'promo_redeemed',
+        ok: true,
+        requestId,
+        code,
+        reward,
+        premiumGrant,
+        message: reward.label || 'Kod başarıyla kullanıldı.',
+      });
+      return;
+    }
+
     if (type === 'admin_login') {
       state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
       state.benchmarkScores = state.benchmarkScores || {};
@@ -597,6 +688,9 @@ wss.on('connection', (socket) => {
         imageBase64: String(data.imageBase64 || '').slice(0, 2200000),
         videoBase64: String(data.videoBase64 || '').slice(0, 2600000),
         active: data.active !== false,
+        pinned: data.pinned === true,
+        priority: Math.max(0, Math.min(Number(data.priority || 0), 100)),
+        expiresAt: String(data.expiresAt || '').slice(0, 80),
         order: Number(data.order || 0),
         time: incomingId ? ((state.announcements || []).find((x) => x.id === incomingId)?.time || new Date().toISOString()) : new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -656,6 +750,47 @@ wss.on('connection', (socket) => {
       adminAudit('delete_custom_panel', { id });
       saveStateSoon();
       send(socket, { type: 'admin_delete_custom_panel', ok: true, requestId, id });
+      return;
+    }
+
+    if (type === 'admin_upsert_promo_code') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      state.promoCodes = state.promoCodes || {};
+      const code = String(data.code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 48);
+      if (!code) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Promo code required' });
+      const existing = state.promoCodes[code] || {};
+      const rewardTypes = ['premium', 'ad_free', 'winsim', 'friends_minutes'];
+      const rewardType = rewardTypes.includes(String(data.rewardType || '')) ? String(data.rewardType) : 'premium';
+      const item = {
+        ...existing,
+        code,
+        rewardType,
+        durationMinutes: Math.max(1, Math.min(Number(data.durationMinutes || 60), 525600)),
+        totalMinutes: Math.max(10, Math.min(Number(data.totalMinutes || data.durationMinutes || 30), 1440)),
+        maxUses: Math.max(0, Math.min(Number(data.maxUses || 0), 1000000)),
+        active: data.active !== false,
+        expiresAt: String(data.expiresAt || '').slice(0, 80),
+        label: String(data.label || '').slice(0, 240),
+        note: String(data.note || '').slice(0, 1000),
+        usedBy: Array.isArray(existing.usedBy) ? existing.usedBy : [],
+        uses: Array.isArray(existing.usedBy) ? existing.usedBy.length : Number(existing.uses || 0),
+        createdAt: existing.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      state.promoCodes[code] = item;
+      adminAudit('upsert_promo_code', { code, rewardType, active: item.active, maxUses: item.maxUses });
+      saveStateSoon();
+      send(socket, { type: 'admin_upsert_promo_code', ok: true, requestId, item });
+      return;
+    }
+
+    if (type === 'admin_delete_promo_code') {
+      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      const code = String(data.code || '').trim().toUpperCase();
+      delete state.promoCodes[code];
+      adminAudit('delete_promo_code', { code });
+      saveStateSoon();
+      send(socket, { type: 'admin_delete_promo_code', ok: true, requestId, code });
       return;
     }
 
@@ -1229,5 +1364,5 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 httpServer.listen(PORT, () => {
-  console.log(`RelaxFPS Friends Server v4.1-admin running on ws://0.0.0.0:${PORT}`);
+  console.log(`RelaxFPS Friends Server v4.2-admin-rewards running on ws://0.0.0.0:${PORT}`);
 });
