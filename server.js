@@ -56,7 +56,7 @@ function defaultAppSettings() {
     freeFriendMinutes: 10,
     premiumFriendMinutes: 60,
     appLockFailLimit: 3,
-    appLockLockMinutes: 10,
+    appLockLockMinutes: 2,
     betaToolsEnabled: true,
     adsEnabled: true,
     telemetryEnabled: true,
@@ -87,6 +87,7 @@ const state = {
   backups: [], // {id,time,size,summary,data}
   adminAuditLog: [], // {action, detail, time}
   adminSecurity: { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 },
+  benchmarkScores: {}, // RelaxFPS ID -> latest persistent RelaxBench result
 };
 
 function loadState() {
@@ -101,6 +102,7 @@ function loadState() {
       state.premiumUsers = state.premiumUsers || {};
       state.bannedUsers = state.bannedUsers || {};
       state.appSettings = normalizeAppSettings(state.appSettings);
+      if (Number(state.appSettings.appLockLockMinutes || 0) === 10) state.appSettings.appLockLockMinutes = 2;
       state.crashReports = Array.isArray(state.crashReports) ? state.crashReports : [];
       state.clientEvents = Array.isArray(state.clientEvents) ? state.clientEvents : [];
       state.testUsers = state.testUsers || {};
@@ -108,6 +110,7 @@ function loadState() {
       state.backups = Array.isArray(state.backups) ? state.backups : [];
       state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
       state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
+      state.benchmarkScores = state.benchmarkScores || {};
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -451,6 +454,33 @@ function pushDeveloperMessages(id, socket) {
   if (items.length) send(socket, { type: 'developer_messages', items });
 }
 
+function publicBenchmarkLeaderboard(limit = 100) {
+  const maxItems = Math.max(10, Math.min(Number(limit || 100), 250));
+  return Object.values(state.benchmarkScores || {})
+    .filter((item) => item && Number(item.totalScore || 0) > 0)
+    .sort((a, b) => Number(b.totalScore || 0) - Number(a.totalScore || 0) || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+    .slice(0, maxItems)
+    .map((item, index) => ({
+      rank: index + 1,
+      id: item.id,
+      displayId: String(item.id || '').replace(/^(RFX-\d{2})\d{2}-(\d{2})\d{2}$/, '$1**-$2**'),
+      manufacturer: item.manufacturer || '',
+      model: item.model || 'Unknown device',
+      androidVersion: item.androidVersion || '',
+      totalScore: Number(item.totalScore || 0),
+      categoryScores: item.categoryScores || {},
+      updatedAt: item.updatedAt || '',
+    }));
+}
+
+function benchmarkComparison(model, totalScore) {
+  const cleanModel = String(model || '').trim().toLowerCase();
+  const matching = Object.values(state.benchmarkScores || {}).filter((item) => String(item.model || '').trim().toLowerCase() === cleanModel && Number(item.totalScore || 0) > 0);
+  const average = matching.length ? Math.round(matching.reduce((sum, item) => sum + Number(item.totalScore || 0), 0) / matching.length) : Number(totalScore || 0);
+  const differencePercent = average > 0 ? Math.round(((Number(totalScore || 0) - average) / average) * 1000) / 10 : 0;
+  return { sampleCount: matching.length, average, differencePercent };
+}
+
 loadState();
 
 wss.on('connection', (socket) => {
@@ -486,8 +516,50 @@ wss.on('connection', (socket) => {
       return;
     }
 
+    if (type === 'bench_leaderboard') {
+      const requester = normalizeId(data.id || currentId);
+      const leaderboard = publicBenchmarkLeaderboard(data.limit);
+      const mine = validId(requester) ? (state.benchmarkScores || {})[requester] || null : null;
+      const all = publicBenchmarkLeaderboard(250);
+      const rank = mine ? all.findIndex((item) => item.id === requester) + 1 : 0;
+      const comparison = mine ? benchmarkComparison(mine.model, mine.totalScore) : null;
+      send(socket, { type: 'bench_leaderboard', ok: true, requestId, leaderboard, mine, rank, comparison, totalDevices: Object.keys(state.benchmarkScores || {}).length });
+      return;
+    }
+
+    if (type === 'bench_submit') {
+      const id = normalizeId(data.id || currentId);
+      const totalScore = Math.max(0, Math.min(Number(data.totalScore || 0), 2000000));
+      if (!validId(id) || totalScore <= 0) {
+        send(socket, { type: 'bench_submit', ok: false, requestId, message: 'Valid RelaxFPS ID and score required' });
+        return;
+      }
+      const categoryScores = data.categoryScores && typeof data.categoryScores === 'object' ? data.categoryScores : {};
+      const previous = (state.benchmarkScores || {})[id] || null;
+      const item = {
+        id,
+        manufacturer: String(data.manufacturer || '').slice(0, 80),
+        model: String(data.model || 'Unknown device').slice(0, 120),
+        androidVersion: String(data.androidVersion || '').slice(0, 40),
+        totalScore,
+        categoryScores,
+        previousScore: previous ? Number(previous.totalScore || 0) : 0,
+        createdAt: previous && previous.createdAt ? previous.createdAt : new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      state.benchmarkScores = state.benchmarkScores || {};
+      state.benchmarkScores[id] = item;
+      saveStateSoon();
+      const all = publicBenchmarkLeaderboard(250);
+      const rank = all.findIndex((entry) => entry.id === id) + 1;
+      const comparison = benchmarkComparison(item.model, item.totalScore);
+      send(socket, { type: 'bench_submit', ok: true, requestId, item, previous, rank, comparison, leaderboard: all.slice(0, 100), totalDevices: all.length });
+      return;
+    }
+
     if (type === 'admin_login') {
       state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
+      state.benchmarkScores = state.benchmarkScores || {};
       if (String(data.password || '') === ADMIN_PASSWORD) {
         isAdmin = true;
         state.adminSecurity.wrongPasswordCount = 0;
@@ -701,6 +773,7 @@ wss.on('connection', (socket) => {
       state.backups = Array.isArray(state.backups) ? state.backups : [];
       state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
       state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
+      state.benchmarkScores = state.benchmarkScores || {};
       if (data.banned === true) {
         const minutes = Math.max(0, Math.min(Number(data.minutes || 0), 525600));
         const until = minutes > 0 ? new Date(Date.now() + minutes * 60 * 1000).toISOString() : null;
