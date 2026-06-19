@@ -25,3 +25,22 @@ admin_clear_admin_log
 admin_clear_crash_reports
 admin_update_security
 ```
+Büyük Yenileme Paketi
+Bu sürümde Admin Studio ayarları uygulama tarafından `get_app_config` ile okunur. Bakım modu ve temel özellik aç/kapat değerleri istemciye uygulanır. Admin panelinden verilen Premium erişim, kullanıcının sunucuya kayıt olduğu anda `premiumGrant` alanıyla veya çevrim içiyken `premium_granted` olayıyla gönderilir. Kaldırma işlemi `premium_removed` olayıyla bildirilir.
+RelaxBench genel cihaz sıralaması
+```json
+{ "type": "bench_leaderboard", "requestId": "...", "id": "RFX-1234-5678", "limit": 100 }
+```
+```json
+{
+  "type": "bench_submit",
+  "requestId": "...",
+  "id": "RFX-1234-5678",
+  "manufacturer": "Xiaomi",
+  "model": "Device model",
+  "androidVersion": "15",
+  "totalScore": 123456,
+  "categoryScores": { "cpu": 20000, "gpu": 25000 }
+}
+```
+Sunucu her RelaxFPS kimliği için son testi kalıcı state dosyasına kaydeder; genel sıra, kişisel sıra, önceki skor ve aynı model ortalaması döndürülür.
