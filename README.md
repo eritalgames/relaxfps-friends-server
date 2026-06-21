@@ -1,7 +1,7 @@
 Admin Studio v2 Genişletme
 Bu sürümde gizli geliştirici paneli uygulamayı uzaktan yönetmek için genişletildi.
 Yeni yönetim alanları:
-Uzaktan özellik aç/kapat: Friends, Community, RelaxBench, WinSimPro, Gaming Extreme, App Lock, Sound Booster, Virtual RAM, Overlay, mesajlaşma, görsel, sesli arama ve Relay Voice.
+Uzaktan özellik aç/kapat: Friends, Groups (`communityEnabled` uyumluluk anahtarı), RelaxBench, WinSimPro, Gaming Extreme, App Lock, Sound Booster, Virtual RAM, Overlay, mesajlaşma, görsel, sesli arama ve Relay Voice.
 Bakım modu: bakım mesajı ve tahmini bitiş notu.
 Zorunlu güncelleme: minimum sürüm, son sürüm, Play Store linki ve güncelleme mesajı.
 Kullanıcı yönetimi: premium süresi, ban, test kullanıcısı, kullanıcı notu, tek/toplu geliştirici mesajı.
@@ -57,3 +57,28 @@ Admin komutları:
 ```
 Desteklenen ödül türleri: `premium`, `ad_free`, `winsim`, `friends_minutes`. Kodlar kullanıcı başına bir kez kullanılabilir; son kullanım tarihi ve toplam kullanım limiti belirlenebilir.
 Duyuru editörüne sabitleme, 0–100 öncelik ve isteğe bağlı bitiş tarihi alanları eklendi. Sabit ve yüksek öncelikli duyurular kullanıcı akışında önce gösterilir.
+
+v5.0 Arkadaşlar, Gruplar ve Relay Voice
+Bu sürüm Arkadaşlar bölümünü tek merkezli çevrim içi sistem haline getirir.
+Başlıca yenilikler:
+Birebir mesajlarda gönderildi, iletildi ve okundu zamanları.
+Mesajı herkesten silme ve karşı tarafta “Bu mesaj silindi” durumu.
+Android mesaj ve çağrı bildirimleri için genişletilmiş olay verileri.
+Birebir ve grup Relay Voice paket yönlendirmesi.
+Grup oluşturma, davet, kabul/red, yönetici, üye çıkarma, ayrılma ve grup silme.
+Grup mesaj geçmişi, görsel mesajlar ve grup araması.
+Ücretsiz Arkadaşlar süresi 15 dakika.
+Çevrim içi kullanım süresi RelaxFPS kimliğine göre sunucuda kalıcı tutulur; yeniden kurulumda süre yeniden başlamaz.
+Aynı kullanıcı birden fazla sohbet/arama bağlantısı açsa bile kullanım süresi yalnız bir kez işler.
+Yeni veya genişletilen istemci komutları:
+```json
+{ "type": "friend_usage_status", "id": "RFX-1234-5678", "timezoneOffsetMinutes": 180 }
+{ "type": "message_delete", "from": "RFX-...", "to": "RFX-...", "messageId": "...", "deleteForAll": true }
+{ "type": "groups_list", "id": "RFX-..." }
+{ "type": "group_create", "from": "RFX-...", "name": "Takım" }
+{ "type": "group_invite", "groupId": "group-...", "from": "RFX-...", "to": "RFX-..." }
+{ "type": "group_message", "groupId": "group-...", "from": "RFX-...", "kind": "text", "text": "Merhaba" }
+{ "type": "group_call_invite", "groupId": "group-...", "from": "RFX-..." }
+{ "type": "group_relay_audio", "groupId": "group-...", "from": "RFX-...", "data": "...", "sampleRate": 8000 }
+```
+Kayıt yanıtındaki `friendUsage` alanı günlük kullanılan, kalan ve toplam saniyeyi döndürür. Sunucu çevrim içi kullanıcılara yaklaşık 10 saniyede bir `friend_usage` olayı gönderir.
