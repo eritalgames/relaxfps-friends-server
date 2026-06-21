@@ -82,3 +82,22 @@ Yeni veya genişletilen istemci komutları:
 { "type": "group_relay_audio", "groupId": "group-...", "from": "RFX-...", "data": "...", "sampleRate": 8000 }
 ```
 Kayıt yanıtındaki `friendUsage` alanı günlük kullanılan, kalan ve toplam saniyeyi döndürür. Sunucu çevrim içi kullanıcılara yaklaşık 10 saniyede bir `friend_usage` olayı gönderir.
+
+v5.1 Sunucuya Bağlı Günlük Ödül Çarkı
+Çark durumu artık cihazdaki yerel kayda güvenmez. Son çevirme zamanı, 24 saatlik kilit, ödül geçmişi, kişisel kodlar ve geçici erişimler RelaxFPS kimliğine göre sunucu state dosyasında tutulur. Uygulama kaldırılıp yeniden kurulduğunda aynı kalıcı ID ile veriler geri gelir.
+Yeni public komutlar:
+```json
+{ "type": "get_daily_wheel_state", "requestId": "...", "id": "RFX-1234-5678" }
+{ "type": "spin_daily_wheel", "requestId": "...", "id": "RFX-1234-5678" }
+{ "type": "get_premium_offer_state", "requestId": "...", "id": "RFX-1234-5678" }
+```
+Ödül dağılımı:
+`%20` +20 dakika çevrim içi süre
+`%4` 1 saat Premium kişisel kodu
+`%10` 1 gün WinSimPro
+`%2` Premium ilk ay `%20` indirim kodu
+`%40` tekrar dene; hak tüketilmez ancak yeniden reklam gerekir
+`%2` 1 gün Shizuku Tools
+`%2` Premium ilk ay `%40` indirim kodu
+`%20` 6 saat reklamsız kullanım
+Kişisel çark kodlarında `ownerId` bulunur ve kod başka RelaxFPS kimliğinde kullanılamaz. Premium indirim kodlarının gerçek Google Play fiyatına uygulanabilmesi için Play Console abonelik tekliflerinde sırasıyla `relaxfps_wheel_20` ve `relaxfps_wheel_40` teklif etiketleri tanımlanmalıdır.
