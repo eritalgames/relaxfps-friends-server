@@ -2,6 +2,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'relaxfps-friends-data.json');
@@ -12,7 +13,7 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '5.0.0-friends-groups',
+      version: '5.1.0-wheel-server',
       online: onlineIds().length,
       time: new Date().toISOString(),
     }));
@@ -95,6 +96,8 @@ const state = {
   groupInvites: [], // {id,groupId,from,to,status,time}
   groupMessages: {}, // groupId -> message payloads
   friendUsage: {}, // RelaxFPS ID -> {day,usedSeconds,timezoneOffsetMinutes,updatedAt}
+  dailyWheel: {}, // RelaxFPS ID -> persistent wheel state, history and temporary grants
+  premiumDiscounts: {}, // RelaxFPS ID -> active Google Play offer entitlement
 };
 
 function loadState() {
@@ -123,6 +126,8 @@ function loadState() {
       state.groupInvites = Array.isArray(state.groupInvites) ? state.groupInvites : [];
       state.groupMessages = state.groupMessages || {};
       state.friendUsage = state.friendUsage || {};
+      state.dailyWheel = state.dailyWheel || {};
+      state.premiumDiscounts = state.premiumDiscounts || {};
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -323,7 +328,11 @@ function friendUsageSnapshot(id, timezoneOffsetMinutes = null) {
   const minutes = premium
     ? Number(state.appSettings?.premiumFriendMinutes || 60)
     : Number(state.appSettings?.freeFriendMinutes || 15);
-  const limitSeconds = Math.max(0, Math.round(minutes * 60));
+  const wheel = dailyWheelRecord(clean);
+  const onlineBonusSeconds = Number(wheel.grants?.onlineBonusUntil || 0) > Date.now()
+    ? Math.max(0, Number(wheel.grants?.onlineBonusSeconds || 0))
+    : 0;
+  const limitSeconds = Math.max(0, Math.round(minutes * 60) + onlineBonusSeconds);
   const usedSeconds = Math.max(0, Number(record.usedSeconds || 0));
   return {
     id: clean,
@@ -333,6 +342,7 @@ function friendUsageSnapshot(id, timezoneOffsetMinutes = null) {
     remainingSeconds: Math.max(0, limitSeconds - usedSeconds),
     timezoneOffsetMinutes: Number(record.timezoneOffsetMinutes || 0),
     premium,
+    onlineBonusSeconds,
     updatedAt: record.updatedAt || new Date().toISOString(),
   };
 }
@@ -629,6 +639,8 @@ function adminSnapshot() {
       crashReports: (state.crashReports || []).length,
       clientEvents: (state.clientEvents || []).length,
       promoCodes: Object.keys(state.promoCodes || {}).length,
+      wheelUsers: Object.keys(state.dailyWheel || {}).length,
+      activeDiscounts: Object.keys(state.premiumDiscounts || {}).length,
       dataFileBytes: safeFileSize(DATA_FILE),
     },
     onlineIds: onlineIds(),
@@ -667,6 +679,198 @@ function publicBenchmarkLeaderboard(limit = 100) {
       categoryScores: item.categoryScores || {},
       updatedAt: item.updatedAt || '',
     }));
+}
+
+
+
+const DAILY_WHEEL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const DAILY_WHEEL_CODE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const DAILY_WHEEL_REWARDS = [
+  { id: 'online_20m', label: '+20 dakika çevrim içi süre', wheelLabel: '+20 DK\nONLINE', weight: 20, kind: 'online' },
+  { id: 'premium_code_1h', label: '1 saat Premium referans kodu', wheelLabel: '1 SAAT\nPREMIUM KOD', weight: 4, kind: 'code' },
+  { id: 'winsim_1d', label: '1 gün WinSimPro oturumu', wheelLabel: 'WINSIMPRO\n1 GÜN', weight: 10, kind: 'grant' },
+  { id: 'discount_20', label: 'Premium ilk ay %20 indirim kodu', wheelLabel: '%20\nİNDİRİM', weight: 2, kind: 'code' },
+  { id: 'retry', label: 'Tekrar dene', wheelLabel: 'TEKRAR\nDENE', weight: 40, kind: 'retry' },
+  { id: 'shizuku_1d', label: '1 günlük Shizuku Tools erişimi', wheelLabel: 'SHIZUKU\n1 GÜN', weight: 2, kind: 'grant' },
+  { id: 'discount_40', label: 'Premium ilk ay %40 indirim kodu', wheelLabel: '%40\nİNDİRİM', weight: 2, kind: 'code' },
+  // Kullanıcının verdiği oranlar %80 ettiği için kalan %20, düşük riskli reklamsız kullanım ödülüne ayrıldı.
+  { id: 'ads_6h', label: '6 saat reklamsız kullanım', wheelLabel: '6 SAAT\nREKLAMSIZ', weight: 20, kind: 'grant' },
+];
+
+function dailyWheelRecord(id) {
+  const clean = normalizeId(id);
+  state.dailyWheel = state.dailyWheel || {};
+  const current = state.dailyWheel[clean] && typeof state.dailyWheel[clean] === 'object' ? state.dailyWheel[clean] : {};
+  current.id = clean;
+  current.lastSpinAt = String(current.lastSpinAt || '');
+  current.nextSpinAt = String(current.nextSpinAt || '');
+  current.history = Array.isArray(current.history) ? current.history : [];
+  current.grants = current.grants && typeof current.grants === 'object' ? current.grants : {};
+  state.dailyWheel[clean] = current;
+  return current;
+}
+
+function activePremiumDiscount(id) {
+  const clean = normalizeId(id);
+  state.premiumDiscounts = state.premiumDiscounts || {};
+  const item = state.premiumDiscounts[clean];
+  if (!item) return null;
+  if (item.expiresAt && Date.parse(item.expiresAt) <= Date.now()) {
+    delete state.premiumDiscounts[clean];
+    saveStateSoon();
+    return null;
+  }
+  return item;
+}
+
+function chooseDailyWheelReward() {
+  const total = DAILY_WHEEL_REWARDS.reduce((sum, item) => sum + Number(item.weight || 0), 0);
+  let ticket = crypto.randomInt(Math.max(1, total));
+  for (const reward of DAILY_WHEEL_REWARDS) {
+    const weight = Math.max(0, Number(reward.weight || 0));
+    if (ticket < weight) return reward;
+    ticket -= weight;
+  }
+  return DAILY_WHEEL_REWARDS[DAILY_WHEEL_REWARDS.length - 1];
+}
+
+function randomWheelCode(prefix = 'WHEEL') {
+  state.promoCodes = state.promoCodes || {};
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const raw = crypto.randomBytes(6).toString('hex').toUpperCase();
+    const code = `${prefix}-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+    if (!state.promoCodes[code]) return code;
+  }
+  return `${prefix}-${Date.now().toString(36).toUpperCase()}`;
+}
+
+function createWheelPromoCode(id, reward) {
+  const clean = normalizeId(id);
+  const now = Date.now();
+  let code;
+  let item;
+  if (reward.id === 'premium_code_1h') {
+    code = randomWheelCode('RFXPREM');
+    item = {
+      code,
+      ownerId: clean,
+      rewardType: 'premium',
+      durationMinutes: 60,
+      totalMinutes: 60,
+      maxUses: 1,
+      active: true,
+      expiresAt: new Date(now + DAILY_WHEEL_CODE_LIFETIME_MS).toISOString(),
+      label: 'Çark ödülü: 1 saat Premium',
+      note: 'Daily wheel generated personal Premium code',
+      usedBy: [], uses: 0,
+      createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(), source: 'daily_wheel',
+    };
+  } else {
+    const percent = reward.id === 'discount_40' ? 40 : 20;
+    code = randomWheelCode(percent === 40 ? 'RFX40' : 'RFX20');
+    item = {
+      code,
+      ownerId: clean,
+      rewardType: 'premium_discount',
+      durationMinutes: 7 * 24 * 60,
+      totalMinutes: 0,
+      discountPercent: percent,
+      offerTag: percent === 40 ? 'relaxfps_wheel_40' : 'relaxfps_wheel_20',
+      maxUses: 1,
+      active: true,
+      expiresAt: new Date(now + DAILY_WHEEL_CODE_LIFETIME_MS).toISOString(),
+      label: percent === 40 ? 'Çark ödülü: Premium ilk ay %40 indirim' : 'Çark ödülü: Premium ilk ay %20 indirim',
+      note: 'Requires matching Google Play subscription offer tag',
+      usedBy: [], uses: 0,
+      createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(), source: 'daily_wheel',
+    };
+  }
+  state.promoCodes[code] = item;
+  return { code, promo: item };
+}
+
+function publicWheelHistory(id, history) {
+  const clean = normalizeId(id);
+  return (Array.isArray(history) ? history : []).slice(0, 50).map((entry) => {
+    const code = String(entry.code || '');
+    const promo = code ? state.promoCodes?.[code] : null;
+    return {
+      ...entry,
+      codeRedeemed: !!(promo && Array.isArray(promo.usedBy) && promo.usedBy.includes(clean)),
+    };
+  });
+}
+
+function dailyWheelSnapshot(id) {
+  const clean = normalizeId(id);
+  const record = dailyWheelRecord(clean);
+  const nextMs = record.nextSpinAt ? Date.parse(record.nextSpinAt) : 0;
+  const now = Date.now();
+  const grants = record.grants || {};
+  return {
+    id: clean,
+    canSpin: !Number.isFinite(nextMs) || nextMs <= now,
+    lastSpinAt: record.lastSpinAt || '',
+    nextSpinAt: Number.isFinite(nextMs) && nextMs > 0 ? new Date(nextMs).toISOString() : '',
+    remainingSeconds: Number.isFinite(nextMs) && nextMs > now ? Math.ceil((nextMs - now) / 1000) : 0,
+    history: publicWheelHistory(clean, record.history),
+    grants: {
+      onlineBonusSeconds: Number(grants.onlineBonusUntil || 0) > now ? Math.max(0, Number(grants.onlineBonusSeconds || 0)) : 0,
+      onlineBonusUntil: Number(grants.onlineBonusUntil || 0) > now ? new Date(Number(grants.onlineBonusUntil)).toISOString() : '',
+      winSimUntil: Number(grants.winSimUntil || 0) > now ? new Date(Number(grants.winSimUntil)).toISOString() : '',
+      shizukuUntil: Number(grants.shizukuUntil || 0) > now ? new Date(Number(grants.shizukuUntil)).toISOString() : '',
+      adsUntil: Number(grants.adsUntil || 0) > now ? new Date(Number(grants.adsUntil)).toISOString() : '',
+    },
+    premiumDiscount: activePremiumDiscount(clean),
+    rewards: DAILY_WHEEL_REWARDS.map(({ id, label, wheelLabel, weight }) => ({ id, label, wheelLabel, weight })),
+    serverTime: new Date(now).toISOString(),
+  };
+}
+
+function applyDailyWheelReward(id, reward) {
+  const clean = normalizeId(id);
+  const record = dailyWheelRecord(clean);
+  const now = Date.now();
+  const grants = record.grants || (record.grants = {});
+  let code = '';
+  let details = {};
+
+  if (reward.id === 'online_20m') {
+    grants.onlineBonusSeconds = 20 * 60;
+    grants.onlineBonusUntil = now + DAILY_WHEEL_COOLDOWN_MS;
+  } else if (reward.id === 'winsim_1d') {
+    grants.winSimUntil = Math.max(now, Number(grants.winSimUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
+  } else if (reward.id === 'shizuku_1d') {
+    grants.shizukuUntil = Math.max(now, Number(grants.shizukuUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
+  } else if (reward.id === 'ads_6h') {
+    grants.adsUntil = Math.max(now, Number(grants.adsUntil || 0)) + 6 * 60 * 60 * 1000;
+  } else if (reward.kind === 'code') {
+    const created = createWheelPromoCode(clean, reward);
+    code = created.code;
+    details = reward.id.startsWith('discount_')
+      ? { discountPercent: Number(created.promo.discountPercent || 0), offerTag: created.promo.offerTag || '' }
+      : { durationMinutes: Number(created.promo.durationMinutes || 0) };
+  }
+
+  const historyItem = {
+    id: `wheel-${now}-${crypto.randomInt(100000)}`,
+    rewardId: reward.id,
+    label: reward.label,
+    code,
+    details,
+    retry: reward.id === 'retry',
+    time: new Date(now).toISOString(),
+  };
+  record.history.unshift(historyItem);
+  if (record.history.length > 50) record.history = record.history.slice(0, 50);
+
+  if (reward.id !== 'retry') {
+    record.lastSpinAt = new Date(now).toISOString();
+    record.nextSpinAt = new Date(now + DAILY_WHEEL_COOLDOWN_MS).toISOString();
+  }
+  record.updatedAt = new Date(now).toISOString();
+  saveStateSoon();
+  return historyItem;
 }
 
 function benchmarkComparison(model, totalScore) {
@@ -753,6 +957,49 @@ wss.on('connection', (socket) => {
       return;
     }
 
+    if (type === 'get_daily_wheel_state') {
+      const id = normalizeId(data.id || currentId);
+      if (!validId(id)) {
+        send(socket, { type: 'daily_wheel_state', ok: false, requestId, message: 'Geçerli RelaxFPS kimliği gerekli.' });
+        return;
+      }
+      send(socket, { type: 'daily_wheel_state', ok: true, requestId, ...dailyWheelSnapshot(id) });
+      return;
+    }
+
+    if (type === 'spin_daily_wheel') {
+      const id = normalizeId(data.id || currentId);
+      if (!validId(id)) {
+        send(socket, { type: 'daily_wheel_spin', ok: false, requestId, message: 'Geçerli RelaxFPS kimliği gerekli.' });
+        return;
+      }
+      const before = dailyWheelSnapshot(id);
+      if (!before.canSpin) {
+        send(socket, { type: 'daily_wheel_spin', ok: false, requestId, message: '24 saatlik çark süren henüz dolmadı.', state: before });
+        return;
+      }
+      const reward = chooseDailyWheelReward();
+      const result = applyDailyWheelReward(id, reward);
+      adminAudit('daily_wheel_spin', { id, rewardId: reward.id, code: result.code || '' });
+      send(socket, {
+        type: 'daily_wheel_spin', ok: true, requestId,
+        reward: { id: reward.id, label: reward.label, wheelLabel: reward.wheelLabel, weight: reward.weight, retry: reward.id === 'retry' },
+        result,
+        state: dailyWheelSnapshot(id),
+      });
+      return;
+    }
+
+    if (type === 'get_premium_offer_state') {
+      const id = normalizeId(data.id || currentId);
+      if (!validId(id)) {
+        send(socket, { type: 'premium_offer_state', ok: false, requestId, message: 'Geçerli RelaxFPS kimliği gerekli.' });
+        return;
+      }
+      send(socket, { type: 'premium_offer_state', ok: true, requestId, offer: activePremiumDiscount(id) });
+      return;
+    }
+
     if (type === 'redeem_promo_code') {
       const id = normalizeId(data.id || currentId);
       const code = String(data.code || '').trim().toUpperCase().replace(/\s+/g, '');
@@ -764,6 +1011,10 @@ wss.on('connection', (socket) => {
       const item = state.promoCodes[code];
       if (!item || item.active === false) {
         send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Kod geçersiz veya devre dışı.' });
+        return;
+      }
+      if (item.ownerId && normalizeId(item.ownerId) !== id) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Bu kişisel kod başka bir RelaxFPS kimliğine ait.' });
         return;
       }
       if (item.expiresAt && Date.parse(item.expiresAt) <= Date.now()) {
@@ -788,6 +1039,8 @@ wss.on('connection', (socket) => {
         type: rewardType,
         durationMinutes,
         totalMinutes,
+        discountPercent: Math.max(0, Math.min(Number(item.discountPercent || 0), 90)),
+        offerTag: String(item.offerTag || '').slice(0, 100),
         label: String(item.label || item.note || 'Promosyon ödülü').slice(0, 240),
       };
       let premiumGrant = null;
@@ -807,6 +1060,17 @@ wss.on('connection', (socket) => {
         };
         premiumGrant = state.premiumUsers[id];
         sendTo(id, { type: 'premium_granted', grant: premiumGrant });
+      } else if (rewardType === 'premium_discount') {
+        state.premiumDiscounts = state.premiumDiscounts || {};
+        const percent = Math.max(1, Math.min(Number(item.discountPercent || 0), 90));
+        const expiresAt = new Date(Date.now() + Math.max(60, durationMinutes) * 60 * 1000).toISOString();
+        state.premiumDiscounts[id] = {
+          id, percent, offerTag: String(item.offerTag || ''), expiresAt,
+          sourceCode: code, redeemedAt: new Date().toISOString(),
+        };
+        reward.discountPercent = percent;
+        reward.offerTag = String(item.offerTag || '');
+        reward.expiresAt = expiresAt;
       }
       item.usedBy.push(id);
       item.uses = item.usedBy.length;
@@ -936,14 +1200,17 @@ wss.on('connection', (socket) => {
       const code = String(data.code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 48);
       if (!code) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Promo code required' });
       const existing = state.promoCodes[code] || {};
-      const rewardTypes = ['premium', 'ad_free', 'winsim', 'friends_minutes'];
+      const rewardTypes = ['premium', 'ad_free', 'winsim', 'friends_minutes', 'premium_discount'];
       const rewardType = rewardTypes.includes(String(data.rewardType || '')) ? String(data.rewardType) : 'premium';
       const item = {
         ...existing,
         code,
         rewardType,
         durationMinutes: Math.max(1, Math.min(Number(data.durationMinutes || 60), 525600)),
-        totalMinutes: Math.max(10, Math.min(Number(data.totalMinutes || data.durationMinutes || 30), 1440)),
+        totalMinutes: Math.max(0, Math.min(Number(data.totalMinutes || data.durationMinutes || 30), 1440)),
+        ownerId: normalizeId(data.ownerId || existing.ownerId || ''),
+        discountPercent: Math.max(0, Math.min(Number(data.discountPercent || existing.discountPercent || 0), 90)),
+        offerTag: String(data.offerTag || existing.offerTag || '').slice(0, 100),
         maxUses: Math.max(0, Math.min(Number(data.maxUses || 0), 1000000)),
         active: data.active !== false,
         expiresAt: String(data.expiresAt || '').slice(0, 80),
@@ -1832,5 +2099,5 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 httpServer.listen(PORT, () => {
-  console.log(`RelaxFPS Friends Server v5.0-friends-groups running on ws://0.0.0.0:${PORT}`);
+  console.log(`RelaxFPS Friends Server v5.1-wheel-server running on ws://0.0.0.0:${PORT}`);
 });
