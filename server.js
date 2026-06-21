@@ -13,7 +13,7 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '5.1.0-wheel-server',
+      version: '5.2.0-flash-offer',
       online: onlineIds().length,
       time: new Date().toISOString(),
     }));
@@ -98,6 +98,7 @@ const state = {
   friendUsage: {}, // RelaxFPS ID -> {day,usedSeconds,timezoneOffsetMinutes,updatedAt}
   dailyWheel: {}, // RelaxFPS ID -> persistent wheel state, history and temporary grants
   premiumDiscounts: {}, // RelaxFPS ID -> active Google Play offer entitlement
+  flashOffers: {}, // RelaxFPS ID -> persistent 3-day flash offer schedule
 };
 
 function loadState() {
@@ -128,6 +129,7 @@ function loadState() {
       state.friendUsage = state.friendUsage || {};
       state.dailyWheel = state.dailyWheel || {};
       state.premiumDiscounts = state.premiumDiscounts || {};
+      state.flashOffers = state.flashOffers || {};
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -723,6 +725,80 @@ function activePremiumDiscount(id) {
   return item;
 }
 
+function premiumFlashOfferState(id) {
+  const clean = normalizeId(id);
+  state.flashOffers = state.flashOffers || {};
+  const current = state.flashOffers[clean] && typeof state.flashOffers[clean] === 'object'
+    ? state.flashOffers[clean]
+    : { id: clean, showCount: 0, lastShownAt: '', activeOffer: null };
+  current.id = clean;
+  current.showCount = Math.max(0, Number(current.showCount || 0));
+  current.lastShownAt = String(current.lastShownAt || '');
+
+  const now = Date.now();
+  const existingDiscount = activePremiumDiscount(clean);
+  const premiumGrant = isPremiumGranted(clean);
+  const lastShownMs = Date.parse(current.lastShownAt) || 0;
+  const nextEligibleMs = lastShownMs > 0 ? lastShownMs + 3 * 24 * 60 * 60 * 1000 : 0;
+
+  if (premiumGrant) {
+    state.flashOffers[clean] = current;
+    return { shouldShow: false, offer: null, nextEligibleAt: nextEligibleMs ? new Date(nextEligibleMs).toISOString() : null, premium: true };
+  }
+
+  if (existingDiscount) {
+    current.activeOffer = existingDiscount;
+    state.flashOffers[clean] = current;
+    return {
+      shouldShow: false,
+      offer: existingDiscount,
+      nextEligibleAt: nextEligibleMs ? new Date(nextEligibleMs).toISOString() : null,
+      premium: false,
+    };
+  }
+
+  if (current.activeOffer && current.activeOffer.expiresAt && Date.parse(current.activeOffer.expiresAt) <= now) {
+    current.activeOffer = null;
+  }
+
+  const due = !lastShownMs || now >= nextEligibleMs;
+  if (!due) {
+    state.flashOffers[clean] = current;
+    return {
+      shouldShow: false,
+      offer: current.activeOffer || null,
+      nextEligibleAt: new Date(nextEligibleMs).toISOString(),
+      premium: false,
+    };
+  }
+
+  const percent = current.showCount === 0 ? 30 : 20;
+  const offerTag = percent === 30 ? 'relaxfps_flash_30' : 'relaxfps_flash_20';
+  const startedAt = new Date(now).toISOString();
+  const expiresAt = new Date(now + 30 * 60 * 1000).toISOString();
+  const offer = {
+    id: clean,
+    percent,
+    offerTag,
+    startedAt,
+    expiresAt,
+    source: 'flash_offer',
+  };
+  current.showCount += 1;
+  current.lastShownAt = startedAt;
+  current.activeOffer = offer;
+  state.flashOffers[clean] = current;
+  state.premiumDiscounts = state.premiumDiscounts || {};
+  state.premiumDiscounts[clean] = offer;
+  saveStateSoon();
+  return {
+    shouldShow: true,
+    offer,
+    nextEligibleAt: new Date(now + 3 * 24 * 60 * 60 * 1000).toISOString(),
+    premium: false,
+  };
+}
+
 function chooseDailyWheelReward() {
   const total = DAILY_WHEEL_REWARDS.reduce((sum, item) => sum + Number(item.weight || 0), 0);
   let ticket = crypto.randomInt(Math.max(1, total));
@@ -954,6 +1030,17 @@ wss.on('connection', (socket) => {
       const rank = all.findIndex((entry) => entry.id === id) + 1;
       const comparison = benchmarkComparison(item.model, item.totalScore);
       send(socket, { type: 'bench_submit', ok: true, requestId, item, previous, rank, comparison, leaderboard: all.slice(0, 100), totalDevices: all.length });
+      return;
+    }
+
+    if (type === 'get_premium_flash_offer') {
+      const id = normalizeId(data.id || currentId);
+      if (!validId(id)) {
+        send(socket, { type: 'premium_flash_offer', ok: false, requestId, message: 'Geçerli RelaxFPS kimliği gerekli.' });
+        return;
+      }
+      const flash = premiumFlashOfferState(id);
+      send(socket, { type: 'premium_flash_offer', ok: true, requestId, ...flash, time: new Date().toISOString() });
       return;
     }
 
