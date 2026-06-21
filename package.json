@@ -1,10 +1,15 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "5.1.0",
-  "description": "RelaxFPS WebSocket server with friends, grouped message notifications, direct and group chats, relay voice calls, groups, admin studio, promo codes and persistent usage tracking, server-authoritative daily wheel rewards and personal promo codes",
+  "version": "6.0.0",
+  "description": "RELAXFPS WebSocket backend with secure browser-based Admin Studio, friends, groups, messaging, relay voice, promos, wheel rewards and persistent usage tracking",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check admin/app.js",
+    "generate:totp": "node tools/generate-totp-secret.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "ws": "^8.18.0"

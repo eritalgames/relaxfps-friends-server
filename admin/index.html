@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#05090f">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>RELAXFPS Admin Studio</title>
+  <link rel="icon" href="/admin/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/admin/styles.css">
+</head>
+<body>
+  <div id="toast" class="toast" aria-live="polite"></div>
+
+  <main id="loginView" class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark" aria-hidden="true"><span>R</span></div>
+      <p class="eyebrow">ERITAL GAMES</p>
+      <h1>RELAXFPS<br><strong>Admin Studio</strong></h1>
+      <p class="muted">Yönetim paneli yalnız yetkili geliştirici hesabı içindir.</p>
+
+      <form id="loginForm" class="stack" autocomplete="off">
+        <label>
+          <span>Yönetici parolası</span>
+          <input id="passwordInput" name="password" type="password" autocomplete="current-password" required maxlength="256" placeholder="••••••••••••">
+        </label>
+        <label id="otpField" class="hidden">
+          <span>Authenticator kodu</span>
+          <input id="otpInput" name="otp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="000000">
+        </label>
+        <button id="loginButton" class="primary wide" type="submit">Güvenli giriş yap</button>
+      </form>
+      <p id="loginStatus" class="status-line">Sunucu durumu kontrol ediliyor…</p>
+    </section>
+  </main>
+
+  <div id="appView" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-mark small"><span>R</span></div>
+        <div><b>RELAXFPS</b><small>Admin Studio</small></div>
+      </div>
+      <nav id="navList" class="nav-list" aria-label="Yönetim menüsü">
+        <button data-page="overview" class="active"><span>◈</span> Genel Bakış</button>
+        <button data-page="content"><span>▤</span> İçerik</button>
+        <button data-page="users"><span>◎</span> Kullanıcılar</button>
+        <button data-page="app-control"><span>⚙</span> Uygulama Kontrolü</button>
+        <button data-page="feedback"><span>✉</span> Geri Bildirim</button>
+        <button data-page="security"><span>⬡</span> Güvenlik</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="connectionDot" class="dot"></span>
+        <span id="connectionText">Bağlanıyor…</span>
+      </div>
+    </aside>
+
+    <section class="main-area">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="pageEyebrow">YÖNETİM MERKEZİ</p>
+          <h2 id="pageTitle">Genel Bakış</h2>
+        </div>
+        <div class="top-actions">
+          <span id="sessionTimer" class="session-chip">--:--</span>
+          <button id="refreshButton" class="ghost" type="button">Yenile</button>
+          <button id="logoutButton" class="danger ghost" type="button">Çıkış</button>
+        </div>
+      </header>
+      <div id="pageContent" class="page-content"></div>
+    </section>
+  </div>
+
+  <dialog id="confirmDialog" class="modal">
+    <form method="dialog" class="modal-card">
+      <h3 id="confirmTitle">İşlemi onayla</h3>
+      <p id="confirmText" class="muted"></p>
+      <div class="modal-actions">
+        <button value="cancel" class="ghost">Vazgeç</button>
+        <button id="confirmAccept" value="default" class="danger">Onayla</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/admin/app.js" defer></script>
+</body>
+</html>

@@ -6,22 +6,22 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'relaxfps-friends-data.json');
+const ADMIN_WEB_DIR = path.join(__dirname, 'admin');
+const ADMIN_PASSWORD = String(process.env.RELAXFPS_ADMIN_PASSWORD || '');
+const ADMIN_TOTP_SECRET = String(process.env.RELAXFPS_ADMIN_TOTP_SECRET || '').replace(/\s+/g, '').toUpperCase();
+const ADMIN_SESSION_SECRET = String(process.env.RELAXFPS_ADMIN_SESSION_SECRET || crypto.randomBytes(32).toString('hex'));
+const ADMIN_LOGIN_MAX_ATTEMPTS = Math.max(3, Math.min(Number(process.env.RELAXFPS_ADMIN_LOGIN_MAX_ATTEMPTS || 5), 20));
+const ADMIN_LOGIN_BLOCK_MINUTES = Math.max(1, Math.min(Number(process.env.RELAXFPS_ADMIN_LOGIN_BLOCK_MINUTES || 15), 1440));
+
+const adminSessions = new Map(); // token -> {createdAt, expiresAt, lastUsedAt, ip, userAgent}
+const adminLoginAttempts = new Map(); // ip -> {count, blockedUntil, lastAttemptAt}
 
 const httpServer = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/healthz') {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
-      ok: true,
-      service: 'RelaxFPS Friends Server',
-      version: '5.2.0-flash-offer',
-      online: onlineIds().length,
-      time: new Date().toISOString(),
-    }));
-    return;
-  }
-
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('RELAXFPS Friends Server is running. Use WebSocket: wss://relaxfps-friends-server.onrender.com');
+  handleHttpRequest(req, res).catch((error) => {
+    console.warn('[HTTP ERROR]', error.message);
+    if (!res.headersSent) sendJsonResponse(res, 500, { ok: false, message: 'Internal server error' });
+    else res.end();
+  });
 });
 
 const wss = new WebSocket.Server({ server: httpServer });
@@ -31,7 +31,6 @@ const offlineQueue = new Map(); // RelaxFPS ID -> queued payloads
 const relayRooms = new Map(); // room -> {members:Set<string>, lastActive:number, chunks:number}
 const groupCallRooms = new Map(); // groupId -> {members:Set<string>, lastActive:number, chunks:number}
 const activeFriendUsage = new Map(); // RelaxFPS ID -> {lastCommitMs, timezoneOffsetMinutes}
-const ADMIN_PASSWORD = process.env.RELAXFPS_ADMIN_PASSWORD || '6a32beb1-0e30-83eb-bf71-be356cbd095a';
 
 function defaultAppSettings() {
   return {
@@ -156,6 +155,305 @@ function saveStateNow() {
     console.warn('[STATE] Could not save data file:', error.message);
   }
 }
+
+
+function applySecurityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+}
+
+function sendJsonResponse(res, statusCode, payload, extraHeaders = {}) {
+  applySecurityHeaders(res);
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store, max-age=0',
+    ...extraHeaders,
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function sendTextResponse(res, statusCode, text, contentType = 'text/plain; charset=utf-8') {
+  applySecurityHeaders(res);
+  res.writeHead(statusCode, {
+    'Content-Type': contentType,
+    'Cache-Control': 'no-store, max-age=0',
+  });
+  res.end(text);
+}
+
+function requestIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.socket?.remoteAddress || 'unknown';
+}
+
+function readJsonBody(req, maxBytes = 8192) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(Object.assign(new Error('Request body too large'), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve(text ? JSON.parse(text) : {});
+      } catch (_) {
+        reject(Object.assign(new Error('Invalid JSON body'), { statusCode: 400 }));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function secureStringEqual(a, b) {
+  const aa = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  if (aa.length !== bb.length || aa.length === 0) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+function decodeBase32(value) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = String(value || '').replace(/=+$/g, '').replace(/\s+/g, '').toUpperCase();
+  let bits = '';
+  for (const char of clean) {
+    const index = alphabet.indexOf(char);
+    if (index < 0) throw new Error('Invalid TOTP secret');
+    bits += index.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let index = 0; index + 8 <= bits.length; index += 8) {
+    bytes.push(parseInt(bits.slice(index, index + 8), 2));
+  }
+  return Buffer.from(bytes);
+}
+
+function totpCodeForCounter(secret, counter) {
+  const key = decodeBase32(secret);
+  const buffer = Buffer.alloc(8);
+  const high = Math.floor(counter / 0x100000000);
+  const low = counter >>> 0;
+  buffer.writeUInt32BE(high >>> 0, 0);
+  buffer.writeUInt32BE(low, 4);
+  const digest = crypto.createHmac('sha1', key).update(buffer).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  const value = ((digest[offset] & 0x7f) << 24)
+    | ((digest[offset + 1] & 0xff) << 16)
+    | ((digest[offset + 2] & 0xff) << 8)
+    | (digest[offset + 3] & 0xff);
+  return String(value % 1000000).padStart(6, '0');
+}
+
+function verifyTotp(code) {
+  if (!ADMIN_TOTP_SECRET) return true;
+  const clean = String(code || '').replace(/\D/g, '');
+  if (clean.length !== 6) return false;
+  const counter = Math.floor(Date.now() / 30000);
+  for (let drift = -1; drift <= 1; drift += 1) {
+    if (secureStringEqual(clean, totpCodeForCounter(ADMIN_TOTP_SECRET, counter + drift))) return true;
+  }
+  return false;
+}
+
+function createAdminSession(req) {
+  const now = Date.now();
+  const minutes = Math.max(5, Math.min(Number(state.adminSecurity?.sessionMinutes || 60), 1440));
+  const nonce = crypto.randomBytes(32).toString('base64url');
+  const signature = crypto.createHmac('sha256', ADMIN_SESSION_SECRET).update(nonce).digest('base64url');
+  const token = `${nonce}.${signature}`;
+  const session = {
+    createdAt: now,
+    expiresAt: now + minutes * 60 * 1000,
+    lastUsedAt: now,
+    ip: requestIp(req),
+    userAgent: String(req.headers['user-agent'] || '').slice(0, 240),
+  };
+  adminSessions.set(token, session);
+  return { token, ...session, sessionMinutes: minutes };
+}
+
+function validateAdminSession(token, touch = false) {
+  const clean = String(token || '');
+  if (!clean || !clean.includes('.')) return null;
+  const [nonce, signature] = clean.split('.', 2);
+  const expected = crypto.createHmac('sha256', ADMIN_SESSION_SECRET).update(nonce).digest('base64url');
+  if (!secureStringEqual(signature, expected)) return null;
+  const session = adminSessions.get(clean);
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    adminSessions.delete(clean);
+    return null;
+  }
+  if (touch) session.lastUsedAt = Date.now();
+  return session;
+}
+
+function bearerToken(req) {
+  const authorization = String(req.headers.authorization || '');
+  return authorization.toLowerCase().startsWith('bearer ') ? authorization.slice(7).trim() : '';
+}
+
+function loginAttemptState(ip) {
+  const stateForIp = adminLoginAttempts.get(ip) || { count: 0, blockedUntil: 0, lastAttemptAt: 0 };
+  if (stateForIp.blockedUntil > 0 && stateForIp.blockedUntil <= Date.now()) {
+    stateForIp.count = 0;
+    stateForIp.blockedUntil = 0;
+  }
+  adminLoginAttempts.set(ip, stateForIp);
+  return stateForIp;
+}
+
+function recordFailedAdminLogin(ip) {
+  const attempt = loginAttemptState(ip);
+  attempt.count += 1;
+  attempt.lastAttemptAt = Date.now();
+  if (attempt.count >= ADMIN_LOGIN_MAX_ATTEMPTS) {
+    const multiplier = Math.min(4, Math.max(1, attempt.count - ADMIN_LOGIN_MAX_ATTEMPTS + 1));
+    attempt.blockedUntil = Date.now() + ADMIN_LOGIN_BLOCK_MINUTES * multiplier * 60 * 1000;
+  }
+  adminLoginAttempts.set(ip, attempt);
+  return attempt;
+}
+
+function serveAdminAsset(res, fileName, contentType) {
+  const safeNames = new Set(['index.html', 'app.js', 'styles.css', 'favicon.svg']);
+  if (!safeNames.has(fileName)) return sendTextResponse(res, 404, 'Not found');
+  const filePath = path.join(ADMIN_WEB_DIR, fileName);
+  if (!fs.existsSync(filePath)) return sendTextResponse(res, 404, 'Admin Studio asset not found');
+  applySecurityHeaders(res);
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Cache-Control': fileName === 'index.html' ? 'no-store, max-age=0' : 'public, max-age=300',
+  });
+  fs.createReadStream(filePath).pipe(res);
+}
+
+async function handleHttpRequest(req, res) {
+  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+
+  if (req.method === 'GET' && (pathname === '/health' || pathname === '/healthz')) {
+    sendJsonResponse(res, 200, {
+      ok: true,
+      service: 'RelaxFPS Friends Server',
+      version: '6.0.0-web-admin',
+      online: onlineIds().length,
+      adminStudio: true,
+      time: new Date().toISOString(),
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/admin/api/status') {
+    sendJsonResponse(res, 200, {
+      ok: true,
+      configured: ADMIN_PASSWORD.length >= 12,
+      totpRequired: ADMIN_TOTP_SECRET.length >= 16,
+      sessionMinutes: Math.max(5, Math.min(Number(state.adminSecurity?.sessionMinutes || 60), 1440)),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/admin/api/login') {
+    const ip = requestIp(req);
+    const attempt = loginAttemptState(ip);
+    if (attempt.blockedUntil > Date.now()) {
+      const retryAfter = Math.ceil((attempt.blockedUntil - Date.now()) / 1000);
+      sendJsonResponse(res, 429, {
+        ok: false,
+        message: `Çok fazla hatalı giriş. ${Math.ceil(retryAfter / 60)} dakika sonra tekrar dene.`,
+        retryAfter,
+      }, { 'Retry-After': String(retryAfter) });
+      return;
+    }
+    if (ADMIN_PASSWORD.length < 12) {
+      sendJsonResponse(res, 503, { ok: false, message: 'RELAXFPS_ADMIN_PASSWORD sunucuda ayarlanmamış veya çok kısa.' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 8192);
+    } catch (error) {
+      sendJsonResponse(res, error.statusCode || 400, { ok: false, message: error.message });
+      return;
+    }
+    const passwordOk = secureStringEqual(body.password, ADMIN_PASSWORD);
+    const totpOk = verifyTotp(body.otp);
+    if (!passwordOk || !totpOk) {
+      const failed = recordFailedAdminLogin(ip);
+      state.adminSecurity = state.adminSecurity || {};
+      state.adminSecurity.wrongPasswordCount = Number(state.adminSecurity.wrongPasswordCount || 0) + 1;
+      state.adminSecurity.lastWrongPasswordAt = new Date().toISOString();
+      adminAudit('admin_web_login_failed', { ip, count: failed.count, passwordOk, totpOk });
+      sendJsonResponse(res, 401, { ok: false, message: 'Parola veya doğrulama kodu hatalı.' });
+      return;
+    }
+    adminLoginAttempts.delete(ip);
+    state.adminSecurity = state.adminSecurity || {};
+    state.adminSecurity.wrongPasswordCount = 0;
+    const session = createAdminSession(req);
+    adminAudit('admin_web_login', { ip, totp: ADMIN_TOTP_SECRET.length >= 16, expiresAt: new Date(session.expiresAt).toISOString() });
+    sendJsonResponse(res, 200, {
+      ok: true,
+      token: session.token,
+      expiresAt: session.expiresAt,
+      sessionMinutes: session.sessionMinutes,
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/admin/api/logout') {
+    const token = bearerToken(req);
+    if (token) adminSessions.delete(token);
+    sendJsonResponse(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method === 'GET' && (pathname === '/admin' || pathname === '/admin/')) {
+    serveAdminAsset(res, 'index.html', 'text/html; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/admin/app.js') {
+    serveAdminAsset(res, 'app.js', 'application/javascript; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/admin/styles.css') {
+    serveAdminAsset(res, 'styles.css', 'text/css; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/admin/favicon.svg') {
+    serveAdminAsset(res, 'favicon.svg', 'image/svg+xml; charset=utf-8');
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/') {
+    sendTextResponse(res, 200, 'RELAXFPS Friends Server is running. Admin Studio: /admin');
+    return;
+  }
+
+  sendTextResponse(res, 404, 'Not found');
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of adminSessions.entries()) {
+    if (session.expiresAt <= now) adminSessions.delete(token);
+  }
+  for (const [ip, attempt] of adminLoginAttempts.entries()) {
+    if ((attempt.blockedUntil || attempt.lastAttemptAt || 0) < now - 24 * 60 * 60 * 1000) adminLoginAttempts.delete(ip);
+  }
+}, 60 * 1000).unref?.();
 
 function normalizeId(value) {
   return String(value || '').trim().toUpperCase();
@@ -630,11 +928,18 @@ function adminSnapshot() {
     backups: (state.backups || []).map((b) => ({ id: b.id, time: b.time, size: b.size, summary: b.summary })).slice().reverse().slice(0, 20),
     adminAuditLog: (state.adminAuditLog || []).slice().reverse().slice(0, 160),
     adminSecurity: state.adminSecurity || {},
+    adminAuth: {
+      passwordConfigured: ADMIN_PASSWORD.length >= 12,
+      totpEnabled: ADMIN_TOTP_SECRET.length >= 16,
+      activeSessions: adminSessions.size,
+    },
     analytics: buildAnalytics(),
     systemHealth: {
       profiles: Object.keys(state.profiles || {}).length,
       friendships: Object.keys(state.friendships || {}).length,
       relayRooms: relayRooms.size,
+      groupCallRooms: groupCallRooms.size,
+      groups: Object.keys(state.groups || {}).length,
       online: onlineIds().length,
       messages: Object.values(state.messages || {}).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0),
       dataFile: DATA_FILE,
@@ -650,9 +955,16 @@ function adminSnapshot() {
   };
 }
 
-function requireAdmin(socket, isAdmin, requestId) {
-  if (!isAdmin) {
-    send(socket, { type: 'admin_error', ok: false, requestId, message: 'Admin authorization required' });
+function requireAdmin(socket, adminSessionToken, requestId) {
+  const session = validateAdminSession(adminSessionToken, true);
+  if (!session) {
+    send(socket, {
+      type: 'admin_error',
+      ok: false,
+      requestId,
+      code: 'session_expired',
+      message: 'Admin session expired or is invalid',
+    });
     return false;
   }
   return true;
@@ -961,7 +1273,7 @@ loadState();
 
 wss.on('connection', (socket) => {
   let currentId = null;
-  let isAdmin = false;
+  let adminSessionToken = null;
 
   socket.on('message', (raw) => {
     let data;
@@ -1176,31 +1488,43 @@ wss.on('connection', (socket) => {
       return;
     }
 
-    if (type === 'admin_login') {
-      state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
-      state.benchmarkScores = state.benchmarkScores || {};
-      if (String(data.password || '') === ADMIN_PASSWORD) {
-        isAdmin = true;
-        state.adminSecurity.wrongPasswordCount = 0;
-        adminAudit('admin_login', { ok: true });
-        send(socket, { type: 'admin_login', ok: true, requestId, time: new Date().toISOString(), sessionMinutes: state.adminSecurity.sessionMinutes || 60 });
-      } else {
-        state.adminSecurity.wrongPasswordCount = Number(state.adminSecurity.wrongPasswordCount || 0) + 1;
-        state.adminSecurity.lastWrongPasswordAt = new Date().toISOString();
-        adminAudit('admin_login_failed', { count: state.adminSecurity.wrongPasswordCount });
-        send(socket, { type: 'admin_login', ok: false, requestId, message: 'Invalid admin password' });
+    if (type === 'admin_auth') {
+      const token = String(data.token || '');
+      const session = validateAdminSession(token, true);
+      if (!session) {
+        send(socket, { type: 'admin_auth', ok: false, requestId, code: 'session_expired', message: 'Invalid or expired admin session' });
+        return;
       }
+      adminSessionToken = token;
+      send(socket, {
+        type: 'admin_auth',
+        ok: true,
+        requestId,
+        expiresAt: session.expiresAt,
+        sessionMinutes: state.adminSecurity?.sessionMinutes || 60,
+      });
+      return;
+    }
+
+    if (type === 'admin_login') {
+      send(socket, {
+        type: 'admin_error',
+        ok: false,
+        requestId,
+        code: 'web_admin_required',
+        message: 'Password login is only available from the RELAXFPS Admin Studio web panel',
+      });
       return;
     }
 
     if (type === 'admin_snapshot') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       send(socket, { ...adminSnapshot(), requestId });
       return;
     }
 
     if (type === 'admin_create_announcement' || type === 'admin_upsert_announcement') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const incomingId = String(data.id || '').trim();
       const id = incomingId || `ann-${Date.now()}-${Math.floor(Math.random() * 99999)}`;
       const item = {
@@ -1236,7 +1560,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_delete_announcement') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = String(data.id || '').trim();
       state.announcements = (state.announcements || []).filter((item) => item.id !== id);
       adminAudit('delete_announcement', { id });
@@ -1246,7 +1570,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_upsert_custom_panel') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const incomingId = String(data.id || '').trim();
       const safeBase = String(data.title || 'panel').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50) || 'panel';
       const id = incomingId || `panel-${safeBase}-${Date.now()}`;
@@ -1272,7 +1596,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_delete_custom_panel') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = String(data.id || '').trim();
       state.customPanels = (state.customPanels || []).filter((item) => item.id !== id);
       adminAudit('delete_custom_panel', { id });
@@ -1282,7 +1606,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_upsert_promo_code') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       state.promoCodes = state.promoCodes || {};
       const code = String(data.code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 48);
       if (!code) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Promo code required' });
@@ -1316,7 +1640,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_delete_promo_code') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const code = String(data.code || '').trim().toUpperCase();
       delete state.promoCodes[code];
       adminAudit('delete_promo_code', { code });
@@ -1326,7 +1650,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_update_feedback') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = String(data.id || '').trim();
       const item = (state.feedback || []).find((fb) => fb.id === id);
       if (!item) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Feedback not found' });
@@ -1341,7 +1665,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_update_app_settings') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const next = normalizeAppSettings(state.appSettings);
       const boolKeys = ['maintenanceMode','friendsEnabled','communityEnabled','relaxBenchEnabled','winsimEnabled','gameHubEnabled','appLockEnabled','soundBoosterEnabled','virtualRamEnabled','overlayEnabled','messagingEnabled','imageSharingEnabled','voiceCallEnabled','relayVoiceEnabled','forceUpdate','betaToolsEnabled','adsEnabled','telemetryEnabled'];
       for (const key of boolKeys) if (Object.prototype.hasOwnProperty.call(data, key)) next[key] = data[key] === true;
@@ -1362,7 +1686,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_set_premium') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = normalizeId(data.id);
       if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
       const months = Math.max(0, Math.min(Number(data.months || 0), 60));
@@ -1382,7 +1706,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_send_developer_message') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const to = normalizeId(data.to);
       if (!validId(to)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
       const item = {
@@ -1405,7 +1729,7 @@ wss.on('connection', (socket) => {
 
 
     if (type === 'admin_send_bulk_developer_message') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const toAll = data.toAll === true;
       const ids = Array.isArray(data.ids) ? data.ids.map(normalizeId).filter(validId) : [];
       const targets = toAll ? Object.keys(state.profiles || {}) : Array.from(new Set(ids));
@@ -1427,7 +1751,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_set_ban') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = normalizeId(data.id);
       if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
       state.bannedUsers = state.bannedUsers || {};
@@ -1456,7 +1780,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_set_test_user') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = normalizeId(data.id);
       if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
       state.testUsers = state.testUsers || {};
@@ -1469,7 +1793,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_set_user_note') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = normalizeId(data.id);
       if (!validId(id)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
       state.userNotes = state.userNotes || {};
@@ -1482,7 +1806,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_backup_now') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       saveStateNow();
       const snapshot = JSON.parse(JSON.stringify(state));
       delete snapshot.backups;
@@ -1504,7 +1828,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_clear_admin_log') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       state.adminAuditLog = [];
       adminAudit('clear_admin_log', {});
       saveStateSoon();
@@ -1513,7 +1837,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_clear_crash_reports') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       state.crashReports = [];
       adminAudit('clear_crash_reports', {});
       saveStateSoon();
@@ -1522,7 +1846,7 @@ wss.on('connection', (socket) => {
     }
 
     if (type === 'admin_update_security') {
-      if (!requireAdmin(socket, isAdmin, requestId)) return;
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       state.adminSecurity = state.adminSecurity || {};
       const minutes = Math.max(5, Math.min(Number(data.sessionMinutes || 60), 1440));
       state.adminSecurity.sessionMinutes = minutes;
@@ -2186,5 +2510,8 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 httpServer.listen(PORT, () => {
-  console.log(`RelaxFPS Friends Server v5.1-wheel-server running on ws://0.0.0.0:${PORT}`);
+  console.log(`RelaxFPS Friends Server v6.0-web-admin running on ws://0.0.0.0:${PORT}`);
+  console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
+  if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
+  if (ADMIN_TOTP_SECRET) console.log('[SECURITY] Admin TOTP is enabled.');
 });
