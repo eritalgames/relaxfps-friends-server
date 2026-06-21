@@ -11,6 +11,9 @@ const toastEl = $('#toast');
 const connectionDot = $('#connectionDot');
 const connectionText = $('#connectionText');
 const sessionTimer = $('#sessionTimer');
+const appShell = $('.app-shell');
+const sidebarToggle = $('#sidebarToggle');
+const sidebarBackdrop = $('#sidebarBackdrop');
 
 let authToken = sessionStorage.getItem('relaxfps_admin_token') || '';
 let authExpiresAt = Number(sessionStorage.getItem('relaxfps_admin_expires_at') || 0);
@@ -27,6 +30,18 @@ let serverAuthStatus = { configured: false, totpRequired: false };
 let announcementImageBase64 = '';
 let announcementVideoBase64 = '';
 let panelImageBase64 = '';
+
+function closeSidebar() {
+  if (window.innerWidth <= 980) appShell?.classList.remove('sidebar-open');
+}
+function toggleSidebar(force) {
+  if (!appShell) return;
+  const open = typeof force === 'boolean' ? force : !appShell.classList.contains('sidebar-open');
+  appShell.classList.toggle('sidebar-open', open);
+}
+sidebarToggle?.addEventListener('click', () => toggleSidebar());
+sidebarBackdrop?.addEventListener('click', () => closeSidebar());
+window.addEventListener('resize', () => { if (window.innerWidth > 980) closeSidebar(); });
 
 const titles = {
   overview: ['YÖNETİM MERKEZİ', 'Genel Bakış'],
@@ -132,6 +147,7 @@ $('#loginForm').addEventListener('submit', async (event) => {
 async function enterApp() {
   loginView.classList.add('hidden');
   appView.classList.remove('hidden');
+  closeSidebar();
   await connectWebSocket();
 }
 
@@ -227,6 +243,7 @@ function forceLogin(message = '') {
   clearSession();
   try { ws?.close(); } catch (_) {}
   ws = null;
+  closeSidebar();
   appView.classList.add('hidden');
   loginView.classList.remove('hidden');
   $('#loginStatus').textContent = message || 'Yeniden giriş yapmalısın.';
@@ -252,6 +269,7 @@ $('#navList').addEventListener('click', (event) => {
   currentPage = button.dataset.page;
   $$('#navList button').forEach((item) => item.classList.toggle('active', item === button));
   renderPage();
+  closeSidebar();
 });
 
 function renderPage() {
