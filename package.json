@@ -1,7 +1,7 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "4.2.0",
-  "description": "RelaxFPS WebSocket server with friends, messages, calls, admin studio, announcements, promo codes and reward entitlements",
+  "version": "5.0.0",
+  "description": "RelaxFPS WebSocket server with friends, grouped message notifications, direct and group chats, relay voice calls, groups, admin studio, promo codes and persistent usage tracking",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
