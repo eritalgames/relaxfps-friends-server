@@ -12,7 +12,7 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '4.2.0-admin-rewards',
+      version: '5.0.0-friends-groups',
       online: onlineIds().length,
       time: new Date().toISOString(),
     }));
@@ -28,6 +28,8 @@ const wss = new WebSocket.Server({ server: httpServer });
 const clients = new Map(); // RelaxFPS ID -> Set<WebSocket>
 const offlineQueue = new Map(); // RelaxFPS ID -> queued payloads
 const relayRooms = new Map(); // room -> {members:Set<string>, lastActive:number, chunks:number}
+const groupCallRooms = new Map(); // groupId -> {members:Set<string>, lastActive:number, chunks:number}
+const activeFriendUsage = new Map(); // RelaxFPS ID -> {lastCommitMs, timezoneOffsetMinutes}
 const ADMIN_PASSWORD = process.env.RELAXFPS_ADMIN_PASSWORD || '6a32beb1-0e30-83eb-bf71-be356cbd095a';
 
 function defaultAppSettings() {
@@ -36,7 +38,7 @@ function defaultAppSettings() {
     maintenanceMessage: '',
     maintenanceUntil: '',
     friendsEnabled: true,
-    communityEnabled: false,
+    communityEnabled: true,
     relaxBenchEnabled: true,
     winsimEnabled: true,
     gameHubEnabled: true,
@@ -53,7 +55,7 @@ function defaultAppSettings() {
     minimumVersion: '',
     updateMessage: '',
     playStoreUrl: '',
-    freeFriendMinutes: 10,
+    freeFriendMinutes: 15,
     premiumFriendMinutes: 60,
     appLockFailLimit: 3,
     appLockLockMinutes: 2,
@@ -89,6 +91,10 @@ const state = {
   adminSecurity: { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 },
   benchmarkScores: {}, // RelaxFPS ID -> latest persistent RelaxBench result
   promoCodes: {}, // CODE -> reward definition and usage state
+  groups: {}, // groupId -> {id,name,ownerId,admins,members,createdAt,updatedAt}
+  groupInvites: [], // {id,groupId,from,to,status,time}
+  groupMessages: {}, // groupId -> message payloads
+  friendUsage: {}, // RelaxFPS ID -> {day,usedSeconds,timezoneOffsetMinutes,updatedAt}
 };
 
 function loadState() {
@@ -113,6 +119,10 @@ function loadState() {
       state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
       state.benchmarkScores = state.benchmarkScores || {};
       state.promoCodes = state.promoCodes || {};
+      state.groups = state.groups || {};
+      state.groupInvites = Array.isArray(state.groupInvites) ? state.groupInvites : [];
+      state.groupMessages = state.groupMessages || {};
+      state.friendUsage = state.friendUsage || {};
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -235,6 +245,97 @@ function sendFriendsListToId(id) {
 function onlineIds() {
   return Array.from(clients.keys());
 }
+
+function normalizeTimezoneOffset(value) {
+  const parsed = Number(value || 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(-840, Math.min(840, Math.round(parsed)));
+}
+
+function friendUsageDayKey(timezoneOffsetMinutes = 0, nowMs = Date.now()) {
+  const shifted = new Date(nowMs + normalizeTimezoneOffset(timezoneOffsetMinutes) * 60 * 1000);
+  return shifted.toISOString().slice(0, 10);
+}
+
+function friendUsageRecord(id, timezoneOffsetMinutes = 0) {
+  const clean = normalizeId(id);
+  state.friendUsage = state.friendUsage || {};
+  const offset = normalizeTimezoneOffset(timezoneOffsetMinutes);
+  const day = friendUsageDayKey(offset);
+  const current = state.friendUsage[clean];
+  if (!current || current.day !== day) {
+    state.friendUsage[clean] = {
+      day,
+      usedSeconds: 0,
+      timezoneOffsetMinutes: offset,
+      updatedAt: new Date().toISOString(),
+    };
+  } else {
+    current.timezoneOffsetMinutes = offset;
+  }
+  return state.friendUsage[clean];
+}
+
+function commitFriendUsage(id, nowMs = Date.now()) {
+  const clean = normalizeId(id);
+  const active = activeFriendUsage.get(clean);
+  const offset = active ? active.timezoneOffsetMinutes : (state.friendUsage?.[clean]?.timezoneOffsetMinutes || 0);
+  const record = friendUsageRecord(clean, offset);
+  if (active) {
+    const elapsedSeconds = Math.max(0, Math.floor((nowMs - active.lastCommitMs) / 1000));
+    if (elapsedSeconds > 0) {
+      record.usedSeconds = Math.max(0, Number(record.usedSeconds || 0)) + elapsedSeconds;
+      record.updatedAt = new Date(nowMs).toISOString();
+      active.lastCommitMs += elapsedSeconds * 1000;
+      saveStateSoon();
+    }
+  }
+  return record;
+}
+
+function startFriendUsage(id, timezoneOffsetMinutes = 0) {
+  const clean = normalizeId(id);
+  const offset = normalizeTimezoneOffset(timezoneOffsetMinutes);
+  friendUsageRecord(clean, offset);
+  const existing = activeFriendUsage.get(clean);
+  if (existing) {
+    commitFriendUsage(clean);
+    existing.timezoneOffsetMinutes = offset;
+    return;
+  }
+  activeFriendUsage.set(clean, { lastCommitMs: Date.now(), timezoneOffsetMinutes: offset });
+}
+
+function stopFriendUsage(id) {
+  const clean = normalizeId(id);
+  commitFriendUsage(clean);
+  activeFriendUsage.delete(clean);
+}
+
+function friendUsageSnapshot(id, timezoneOffsetMinutes = null) {
+  const clean = normalizeId(id);
+  if (timezoneOffsetMinutes !== null && timezoneOffsetMinutes !== undefined) {
+    const active = activeFriendUsage.get(clean);
+    if (active) active.timezoneOffsetMinutes = normalizeTimezoneOffset(timezoneOffsetMinutes);
+  }
+  const record = commitFriendUsage(clean);
+  const premium = !!isPremiumGranted(clean);
+  const minutes = premium
+    ? Number(state.appSettings?.premiumFriendMinutes || 60)
+    : Number(state.appSettings?.freeFriendMinutes || 15);
+  const limitSeconds = Math.max(0, Math.round(minutes * 60));
+  const usedSeconds = Math.max(0, Number(record.usedSeconds || 0));
+  return {
+    id: clean,
+    day: record.day,
+    usedSeconds,
+    limitSeconds,
+    remainingSeconds: Math.max(0, limitSeconds - usedSeconds),
+    timezoneOffsetMinutes: Number(record.timezoneOffsetMinutes || 0),
+    premium,
+    updatedAt: record.updatedAt || new Date().toISOString(),
+  };
+}
 function getRelayRoom(roomId) {
   const key = String(roomId || '').slice(0, 120);
   const current = relayRooms.get(key) || { members: new Set(), lastActive: Date.now(), chunks: 0 };
@@ -247,6 +348,9 @@ function cleanupRelayRooms() {
   const now = Date.now();
   for (const [roomId, room] of relayRooms.entries()) {
     if (now - room.lastActive > 10 * 60 * 1000) relayRooms.delete(roomId);
+  }
+  for (const [groupId, room] of groupCallRooms.entries()) {
+    if (now - room.lastActive > 10 * 60 * 1000) groupCallRooms.delete(groupId);
   }
 }
 
@@ -308,6 +412,79 @@ function storeMessage(payload) {
 function historyFor(a, b, limit = 80) {
   const key = conversationKey(a, b);
   return (state.messages[key] || []).slice(-Math.min(Math.max(Number(limit) || 80, 1), 200));
+}
+
+
+function validGroupId(value) {
+  return String(value || '').startsWith('GRP-');
+}
+
+function publicGroup(group) {
+  if (!group) return null;
+  const members = Array.from(new Set((group.members || []).map(normalizeId).filter(validId)));
+  const admins = Array.from(new Set((group.admins || []).map(normalizeId).filter(validId)));
+  return {
+    id: group.id,
+    name: String(group.name || 'RelaxFPS Group').slice(0, 80),
+    ownerId: normalizeId(group.ownerId),
+    members,
+    admins,
+    createdAt: group.createdAt || '',
+    updatedAt: group.updatedAt || '',
+    memberProfiles: members.map(publicProfile),
+    onlineIds: members.filter(isOnline),
+  };
+}
+
+function groupsForUser(id) {
+  const clean = normalizeId(id);
+  return Object.values(state.groups || {})
+    .filter((group) => Array.isArray(group.members) && group.members.includes(clean))
+    .map(publicGroup)
+    .filter(Boolean)
+    .sort((a, b) => String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || '')));
+}
+
+function pendingGroupInvitesFor(id) {
+  const clean = normalizeId(id);
+  return (state.groupInvites || [])
+    .filter((invite) => invite.to === clean && invite.status === 'pending')
+    .map((invite) => ({ ...invite, group: publicGroup(state.groups[invite.groupId]) }));
+}
+
+function sendGroupsState(id) {
+  const clean = normalizeId(id);
+  sendTo(clean, { type: 'groups_list', id: clean, groups: groupsForUser(clean), time: new Date().toISOString() });
+  sendTo(clean, { type: 'group_invites', id: clean, invites: pendingGroupInvitesFor(clean), time: new Date().toISOString() });
+}
+
+function storeGroupMessage(groupId, payload) {
+  state.groupMessages[groupId] = Array.isArray(state.groupMessages[groupId]) ? state.groupMessages[groupId] : [];
+  state.groupMessages[groupId].push(payload);
+  if (state.groupMessages[groupId].length > 1000) state.groupMessages[groupId] = state.groupMessages[groupId].slice(-1000);
+  if (state.groups[groupId]) state.groups[groupId].updatedAt = new Date().toISOString();
+  saveStateSoon();
+}
+
+function groupHistory(groupId, limit = 120) {
+  const items = Array.isArray(state.groupMessages[groupId]) ? state.groupMessages[groupId] : [];
+  return items.slice(-Math.min(Math.max(Number(limit) || 120, 1), 300));
+}
+
+function broadcastToGroup(groupId, payload, exceptId = '') {
+  const group = state.groups[groupId];
+  if (!group) return;
+  for (const memberId of group.members || []) {
+    if (memberId !== exceptId) sendTo(memberId, payload);
+  }
+}
+
+function getGroupCallRoom(groupId) {
+  const key = String(groupId || '').slice(0, 120);
+  const room = groupCallRooms.get(key) || { members: new Set(), lastActive: Date.now(), chunks: 0 };
+  room.lastActive = Date.now();
+  groupCallRooms.set(key, room);
+  return room;
 }
 
 
@@ -1070,8 +1247,13 @@ wss.on('connection', (socket) => {
       const wasOffline = !isOnline(id);
       currentId = id;
       addClient(id, socket);
-      ensureProfile(id, data.name || 'RelaxFPS User');
+      const incomingName = String(data.name || '').trim();
+      ensureProfile(id, incomingName && incomingName !== 'RelaxFPS User' ? incomingName : '');
+      state.profiles[id].appVersion = String(data.appVersion || state.profiles[id].appVersion || '').slice(0, 80);
+      state.profiles[id].language = String(data.language || state.profiles[id].language || '').slice(0, 20);
 
+      if (wasOffline) startFriendUsage(id, data.timezoneOffsetMinutes);
+      const usage = friendUsageSnapshot(id, data.timezoneOffsetMinutes);
       send(socket, {
         type: 'registered',
         id,
@@ -1079,13 +1261,23 @@ wss.on('connection', (socket) => {
         onlineIds: onlineIds(),
         profile: publicProfile(id),
         premiumGrant: isPremiumGranted(id),
+        friendUsage: usage,
       });
       sendFriendsList(socket, id);
+      send(socket, { type: 'groups_list', id, groups: groupsForUser(id), time: new Date().toISOString() });
+      send(socket, { type: 'group_invites', id, invites: pendingGroupInvitesFor(id), time: new Date().toISOString() });
 
       if (wasOffline) broadcastPresence(id, true);
       flushQueue(id);
       pushDeveloperMessages(id, socket);
       console.log(`[REGISTER] ${id} (${socketsFor(id).size} socket(s))`);
+      return;
+    }
+
+    if (type === 'friend_usage_status') {
+      const id = normalizeId(data.id || currentId);
+      if (!validId(id)) return send(socket, { type: 'error', message: 'Valid RelaxFPS ID required' });
+      send(socket, { type: 'friend_usage', ...friendUsageSnapshot(id, data.timezoneOffsetMinutes), requestId });
       return;
     }
 
@@ -1202,7 +1394,7 @@ wss.on('connection', (socket) => {
       }
 
       if (isBanned(from)) return send(socket, { type: 'error', message: 'Your RelaxFPS ID is banned.' });
-      ensureProfile(from, data.name || 'RelaxFPS User');
+      ensureProfile(from, data.name || '');
       ensureProfile(to);
       const payload = {
         type: 'message',
@@ -1215,12 +1407,17 @@ wss.on('connection', (socket) => {
         fileName,
         messageId,
         time: data.time || new Date().toISOString(),
+        fromName: publicProfile(from).name,
+        deliveredAt: null,
+        readAt: null,
+        deleted: false,
       };
       storeMessage(payload);
 
       if (isOnline(to)) {
+        payload.deliveredAt = new Date().toISOString();
         sendTo(to, payload);
-        send(socket, { type: 'delivered', to, messageId, time: new Date().toISOString() });
+        send(socket, { type: 'delivered', to, messageId, time: payload.deliveredAt });
       } else {
         const queue = offlineQueue.get(to) || [];
         queue.push(payload);
@@ -1236,7 +1433,33 @@ wss.on('connection', (socket) => {
       const from = normalizeId(data.from || currentId);
       const to = normalizeId(data.to);
       const messageId = String(data.messageId || '');
-      sendTo(to, { type: 'read', from, to, messageId, time: new Date().toISOString() });
+      const time = new Date().toISOString();
+      const key = conversationKey(from, to);
+      const item = (state.messages[key] || []).find((message) => message.messageId === messageId);
+      if (item) item.readAt = time;
+      saveStateSoon();
+      sendTo(to, { type: 'read', from, to, messageId, time });
+      return;
+    }
+
+    if (type === 'message_delete') {
+      const from = normalizeId(data.from || currentId);
+      const to = normalizeId(data.to);
+      const messageId = String(data.messageId || '');
+      const key = conversationKey(from, to);
+      const item = (state.messages[key] || []).find((message) => message.messageId === messageId);
+      if (!item || item.from !== from) return send(socket, { type: 'error', message: 'Message cannot be deleted', messageId });
+      item.deleted = true;
+      item.text = 'This message was deleted.';
+      item.kind = 'text';
+      item.imageBase64 = '';
+      item.mimeType = '';
+      item.fileName = '';
+      item.deletedAt = new Date().toISOString();
+      saveStateSoon();
+      const payload = { type: 'message_deleted', from, to, messageId, deletedAt: item.deletedAt };
+      sendTo(to, payload);
+      sendTo(from, payload);
       return;
     }
 
@@ -1251,8 +1474,9 @@ wss.on('connection', (socket) => {
       const from = normalizeId(data.from || currentId);
       const to = normalizeId(data.to);
       if (!validId(from) || !validId(to)) return;
-      sendTo(to, { ...data, from, to, time: data.time || new Date().toISOString() });
-      if (type === 'call_invite') send(socket, { type: 'call_ringing', to, mode: data.mode || 'voice' });
+      const callPayload = { ...data, from, to, fromName: publicProfile(from).name, callId: String(data.callId || conversationKey(from, to)), time: data.time || new Date().toISOString() };
+      sendTo(to, callPayload);
+      if (type === 'call_invite') send(socket, { type: 'call_ringing', to, mode: data.mode || 'voice', callId: callPayload.callId });
       return;
     }
 
@@ -1312,6 +1536,240 @@ wss.on('connection', (socket) => {
       return;
     }
 
+    if (type === 'groups_list') {
+      const id = normalizeId(data.id || currentId);
+      if (validId(id)) send(socket, { type: 'groups_list', id, groups: groupsForUser(id), time: new Date().toISOString() });
+      return;
+    }
+
+    if (type === 'group_invites') {
+      const id = normalizeId(data.id || currentId);
+      if (validId(id)) send(socket, { type: 'group_invites', id, invites: pendingGroupInvitesFor(id), time: new Date().toISOString() });
+      return;
+    }
+
+    if (type === 'group_create') {
+      const from = normalizeId(data.from || currentId);
+      if (!validId(from)) return;
+      const name = String(data.name || 'RelaxFPS Group').trim().slice(0, 80);
+      const groupId = `GRP-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 9999).toString().padStart(4, '0')}`;
+      const now = new Date().toISOString();
+      const group = { id: groupId, name, ownerId: from, admins: [from], members: [from], createdAt: now, updatedAt: now };
+      state.groups[groupId] = group;
+      const invitees = Array.isArray(data.members) ? Array.from(new Set(data.members.map(normalizeId).filter((id) => validId(id) && id !== from))) : [];
+      for (const to of invitees) {
+        const invite = { id: `ginv-${Date.now()}-${Math.floor(Math.random() * 99999)}`, groupId, from, to, status: 'pending', time: now };
+        state.groupInvites.push(invite);
+        sendTo(to, { type: 'group_invite', ...invite, groupName: name, fromName: publicProfile(from).name, group: publicGroup(group) });
+      }
+      saveStateSoon();
+      send(socket, { type: 'group_created', ok: true, group: publicGroup(group), invited: invitees });
+      sendGroupsState(from);
+      return;
+    }
+
+    if (type === 'group_invite') {
+      const from = normalizeId(data.from || currentId);
+      const to = normalizeId(data.to);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || !group.members.includes(from) || !validId(to)) return;
+      if (group.members.includes(to)) return send(socket, { type: 'group_error', message: 'User is already a member' });
+      const existing = state.groupInvites.find((i) => i.groupId === groupId && i.to === to && i.status === 'pending');
+      const invite = existing || { id: `ginv-${Date.now()}-${Math.floor(Math.random() * 99999)}`, groupId, from, to, status: 'pending', time: new Date().toISOString() };
+      if (!existing) state.groupInvites.push(invite);
+      saveStateSoon();
+      sendTo(to, { type: 'group_invite', ...invite, groupName: group.name, fromName: publicProfile(from).name, group: publicGroup(group) });
+      send(socket, { type: 'group_invite_sent', ok: true, invite });
+      return;
+    }
+
+    if (type === 'group_accept' || type === 'group_reject') {
+      const id = normalizeId(data.id || currentId);
+      const inviteId = String(data.inviteId || '');
+      const invite = state.groupInvites.find((i) => i.id === inviteId && i.to === id && i.status === 'pending');
+      if (!invite) return send(socket, { type: 'group_error', message: 'Invitation not found' });
+      invite.status = type === 'group_accept' ? 'accepted' : 'rejected';
+      invite.respondedAt = new Date().toISOString();
+      const group = state.groups[invite.groupId];
+      if (type === 'group_accept' && group) {
+        group.members = Array.from(new Set([...(group.members || []), id]));
+        group.updatedAt = new Date().toISOString();
+        broadcastToGroup(group.id, { type: 'group_member_joined', groupId: group.id, member: publicProfile(id), group: publicGroup(group) });
+      }
+      saveStateSoon();
+      sendGroupsState(id);
+      if (group) for (const member of group.members || []) sendGroupsState(member);
+      return;
+    }
+
+    if (type === 'group_history') {
+      const id = normalizeId(data.id || currentId);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || !group.members.includes(id)) return;
+      send(socket, { type: 'group_history', groupId, messages: groupHistory(groupId, data.limit), group: publicGroup(group) });
+      return;
+    }
+
+    if (type === 'group_message') {
+      const from = normalizeId(data.from || currentId);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || !group.members.includes(from)) return;
+      const kind = String(data.kind || 'text').toLowerCase() === 'image' ? 'image' : 'text';
+      const text = String(data.text || '').trim().slice(0, 2000);
+      const imageBase64 = kind === 'image' ? String(data.imageBase64 || '') : '';
+      if ((kind === 'text' && !text) || (kind === 'image' && (!imageBase64 || imageBase64.length > 1300000))) return;
+      const payload = {
+        type: 'group_message',
+        groupId,
+        groupName: group.name,
+        messageId: String(data.messageId || `gm-${Date.now()}-${Math.floor(Math.random() * 99999)}`),
+        from,
+        fromName: publicProfile(from).name,
+        kind,
+        text: kind === 'text' ? text : (text || 'Image'),
+        imageBase64,
+        mimeType: kind === 'image' ? String(data.mimeType || 'image/jpeg').slice(0, 80) : '',
+        fileName: kind === 'image' ? String(data.fileName || 'relaxfps-group-image.jpg').slice(0, 120) : '',
+        time: data.time || new Date().toISOString(),
+        deleted: false,
+      };
+      storeGroupMessage(groupId, payload);
+      broadcastToGroup(groupId, payload);
+      send(socket, { type: 'group_delivered', groupId, messageId: payload.messageId, time: new Date().toISOString() });
+      return;
+    }
+
+    if (type === 'group_message_delete') {
+      const from = normalizeId(data.from || currentId);
+      const groupId = String(data.groupId || '');
+      const messageId = String(data.messageId || '');
+      const group = state.groups[groupId];
+      const item = (state.groupMessages[groupId] || []).find((m) => m.messageId === messageId);
+      if (!group || !item || (item.from !== from && !group.admins.includes(from))) return;
+      item.deleted = true;
+      item.text = 'This message was deleted.';
+      item.kind = 'text';
+      item.imageBase64 = '';
+      item.mimeType = '';
+      item.fileName = '';
+      item.deletedAt = new Date().toISOString();
+      saveStateSoon();
+      broadcastToGroup(groupId, { type: 'group_message_deleted', groupId, messageId, deletedAt: item.deletedAt });
+      return;
+    }
+
+    if (type === 'group_promote_admin') {
+      const from = normalizeId(data.from || currentId);
+      const target = normalizeId(data.target);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || group.ownerId !== from || !group.members.includes(target)) return;
+      group.admins = Array.from(new Set([...(group.admins || []), target]));
+      group.updatedAt = new Date().toISOString();
+      saveStateSoon();
+      broadcastToGroup(groupId, { type: 'group_updated', group: publicGroup(group) });
+      return;
+    }
+
+    if (type === 'group_remove_member') {
+      const from = normalizeId(data.from || currentId);
+      const target = normalizeId(data.target);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || !(group.admins || []).includes(from) || target === group.ownerId) return;
+      group.members = (group.members || []).filter((id) => id !== target);
+      group.admins = (group.admins || []).filter((id) => id !== target);
+      group.updatedAt = new Date().toISOString();
+      saveStateSoon();
+      sendTo(target, { type: 'group_removed', groupId });
+      broadcastToGroup(groupId, { type: 'group_updated', group: publicGroup(group) });
+      sendGroupsState(target);
+      return;
+    }
+
+    if (type === 'group_leave') {
+      const id = normalizeId(data.id || currentId);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || !group.members.includes(id)) return;
+      if (group.ownerId === id) return send(socket, { type: 'group_error', message: 'Owner must delete the group or transfer ownership' });
+      group.members = group.members.filter((member) => member !== id);
+      group.admins = group.admins.filter((member) => member !== id);
+      group.updatedAt = new Date().toISOString();
+      saveStateSoon();
+      broadcastToGroup(groupId, { type: 'group_member_left', groupId, id, group: publicGroup(group) });
+      sendGroupsState(id);
+      return;
+    }
+
+    if (type === 'group_delete') {
+      const from = normalizeId(data.from || currentId);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || group.ownerId !== from) return;
+      const members = [...group.members];
+      delete state.groups[groupId];
+      delete state.groupMessages[groupId];
+      state.groupInvites = state.groupInvites.filter((invite) => invite.groupId !== groupId);
+      saveStateSoon();
+      for (const member of members) {
+        sendTo(member, { type: 'group_deleted', groupId });
+        sendGroupsState(member);
+      }
+      return;
+    }
+
+    if (type === 'group_call_invite') {
+      const from = normalizeId(data.from || currentId);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || !group.members.includes(from)) return;
+      const payload = { type, from, fromName: publicProfile(from).name, groupId, groupName: group.name, group: publicGroup(group), callId: String(data.callId || `gcall-${groupId}`), time: new Date().toISOString() };
+      broadcastToGroup(groupId, payload, from);
+      return;
+    }
+
+    if (type === 'group_call_answer') {
+      const from = normalizeId(data.from || currentId);
+      const groupId = String(data.groupId || '');
+      broadcastToGroup(groupId, { type, from, fromName: publicProfile(from).name, groupId, accepted: data.accepted === true, time: new Date().toISOString() }, from);
+      return;
+    }
+
+    if (type === 'group_relay_join' || type === 'group_relay_audio' || type === 'group_relay_end') {
+      const from = normalizeId(data.from || currentId);
+      const groupId = String(data.groupId || '');
+      const group = state.groups[groupId];
+      if (!group || !group.members.includes(from)) return;
+      const room = getGroupCallRoom(groupId);
+      room.lastActive = Date.now();
+      if (type === 'group_relay_join') room.members.add(from);
+      const payload = { type, from, fromName: publicProfile(from).name, groupId, groupName: group.name, time: new Date().toISOString() };
+      if (type === 'group_relay_audio') {
+        payload.data = String(data.data || '');
+        if (!payload.data) return;
+        payload.format = String(data.format || 'pcm16');
+        payload.sampleRate = Math.max(6000, Math.min(Number(data.sampleRate || 8000), 48000));
+        payload.channels = Number(data.channels || 1);
+        payload.seq = Number(data.seq || 0);
+        payload.level = Number(data.level || 0);
+        payload.speech = data.speech === true;
+        payload.speechStart = data.speechStart === true;
+        payload.speechEnd = data.speechEnd === true;
+        room.chunks += 1;
+      }
+      if (type === 'group_relay_end') {
+        room.members.delete(from);
+        if (room.members.size === 0) groupCallRooms.delete(groupId);
+      }
+      for (const member of room.members) if (member !== from) sendTo(member, payload);
+      broadcastToGroup(groupId, { type: 'group_call_presence', groupId, members: Array.from(room.members), time: new Date().toISOString() });
+      return;
+    }
+
     if (type === 'ping') {
       send(socket, { type: 'pong', time: new Date().toISOString(), onlineIds: onlineIds() });
       return;
@@ -1324,6 +1782,7 @@ wss.on('connection', (socket) => {
     if (currentId) {
       const wentOffline = removeClient(currentId, socket);
       if (wentOffline) {
+        stopFriendUsage(currentId);
         if (state.profiles[currentId]) {
           state.profiles[currentId].lastSeen = new Date().toISOString();
           saveStateSoon();
@@ -1350,12 +1809,21 @@ setInterval(() => {
     }
     if (sockets.size === 0) {
       clients.delete(id);
+      stopFriendUsage(id);
       broadcastPresence(id, false);
     }
   }
 }, 30000);
 
+setInterval(() => {
+  for (const id of activeFriendUsage.keys()) {
+    const snapshot = friendUsageSnapshot(id);
+    sendTo(id, { type: 'friend_usage', ...snapshot });
+  }
+}, 10000).unref?.();
+
 function shutdown() {
+  for (const id of Array.from(activeFriendUsage.keys())) stopFriendUsage(id);
   saveStateNow();
   process.exit(0);
 }
@@ -1364,5 +1832,5 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 httpServer.listen(PORT, () => {
-  console.log(`RelaxFPS Friends Server v4.2-admin-rewards running on ws://0.0.0.0:${PORT}`);
+  console.log(`RelaxFPS Friends Server v5.0-friends-groups running on ws://0.0.0.0:${PORT}`);
 });
