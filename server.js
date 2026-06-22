@@ -33,6 +33,28 @@ const WALLET_MAX_SECURITY_EVENTS = 5000;
 const WALLET_MAX_REQUEST_INDEX = 30000;
 const WALLET_MAX_BALANCE = 1000000000;
 
+// Token C: AdMob rewarded-ad server-side verification (SSV).
+// The official Google key endpoint is used by default. A custom endpoint is
+// accepted only through an explicit server environment variable for isolated tests.
+const ADMOB_SSV_KEYS_URL = String(
+  process.env.RELAXFPS_ADMOB_SSV_KEYS_URL || 'https://www.gstatic.com/admob/reward/verifier-keys.json',
+);
+const ADMOB_REWARDED_AD_UNIT_ID = String(
+  process.env.RELAXFPS_ADMOB_REWARDED_AD_UNIT_ID || '4833556672',
+).trim();
+const ADMOB_AD_SESSION_TTL_MS = Math.max(
+  5 * 60 * 1000,
+  Math.min(Number(process.env.RELAXFPS_ADMOB_SESSION_TTL_MS || 30 * 60 * 1000), 2 * 60 * 60 * 1000),
+);
+const ADMOB_CALLBACK_TOLERANCE_MS = Math.max(
+  10 * 60 * 1000,
+  Math.min(Number(process.env.RELAXFPS_ADMOB_CALLBACK_TOLERANCE_MS || 2 * 60 * 60 * 1000), 24 * 60 * 60 * 1000),
+);
+const ADMOB_KEY_CACHE_MS = 23 * 60 * 60 * 1000;
+const ADMOB_MAX_SESSION_RECORDS = 20000;
+const ADMOB_MAX_TRANSACTION_RECORDS = 30000;
+let admobSsvKeyCache = { fetchedAt: 0, keys: new Map() };
+
 
 // Free persistent storage through Supabase. Keep the secret/service-role key
 // only in Render environment variables; never ship it in Flutter or GitHub.
@@ -156,6 +178,7 @@ function defaultWalletSettings() {
       wide_optimization: 50,
       thermal_pro: 75,
       latency_optimizer: 75,
+      gfx_tool: 50,
       server_10m: 50,
       server_30m: 100,
       server_2h: 250,
@@ -224,6 +247,8 @@ const state = {
   walletTransactions: [], // append-only, HMAC chained token ledger
   walletRequestIndex: {}, // userId:requestId -> transactionId, prevents duplicate spending
   walletSecurityEvents: [], // suspicious wallet activity and integrity warnings
+  walletAdSessions: {}, // sessionId -> pending/verified rewarded-ad SSV session
+  walletAdTransactions: {}, // AdMob transactionId -> user/session/ledger transaction
   walletSettings: defaultWalletSettings(),
   walletLedgerHead: '',
   walletLedgerSequence: 0,
@@ -270,6 +295,8 @@ function applyLoadedState(parsed) {
   state.walletTransactions = Array.isArray(state.walletTransactions) ? state.walletTransactions : [];
   state.walletRequestIndex = state.walletRequestIndex && typeof state.walletRequestIndex === 'object' ? state.walletRequestIndex : {};
   state.walletSecurityEvents = Array.isArray(state.walletSecurityEvents) ? state.walletSecurityEvents : [];
+  state.walletAdSessions = state.walletAdSessions && typeof state.walletAdSessions === 'object' ? state.walletAdSessions : {};
+  state.walletAdTransactions = state.walletAdTransactions && typeof state.walletAdTransactions === 'object' ? state.walletAdTransactions : {};
   state.walletSettings = normalizeWalletSettings(state.walletSettings);
   state.walletLedgerHead = String(state.walletLedgerHead || '');
   state.walletLedgerSequence = Math.max(0, Math.round(Number(state.walletLedgerSequence || 0)));
@@ -757,11 +784,45 @@ async function handleHttpRequest(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
 
+  if (req.method === 'GET' && pathname === '/admob/ssv') {
+    const ip = requestIp(req);
+    const rate = walletRateLimit(`admob-ssv:${ip}`, 120, 60 * 1000, 5 * 60 * 1000);
+    if (!rate.ok) {
+      sendJsonResponse(res, 429, {
+        ok: false,
+        code: 'rate_limited',
+        retryAfterSeconds: rate.retryAfterSeconds,
+      }, { 'Retry-After': String(rate.retryAfterSeconds) });
+      return;
+    }
+    const rawUrl = String(req.url || '');
+    const questionIndex = rawUrl.indexOf('?');
+    const rawQuery = questionIndex >= 0 ? rawUrl.slice(questionIndex + 1) : '';
+    try {
+      const result = await processAdmobSsvCallback(rawQuery, ip);
+      sendJsonResponse(res, result.statusCode || 200, result.payload || { ok: true });
+    } catch (error) {
+      const code = String(error.code || 'admob_ssv_failed');
+      const statusCode = Number(error.statusCode || (code === 'verification_keys_unavailable' ? 503 : 400));
+      walletSecurityEvent('admob_ssv_rejected', {
+        ip,
+        code,
+        message: String(error.message || '').slice(0, 180),
+      }, statusCode >= 500 ? 'warning' : 'high');
+      sendJsonResponse(res, statusCode, {
+        ok: false,
+        code,
+        message: statusCode >= 500 ? 'SSV doğrulama hizmeti geçici olarak kullanılamıyor.' : 'Geçersiz SSV geri çağrısı.',
+      });
+    }
+    return;
+  }
+
   if (req.method === 'GET' && (pathname === '/health' || pathname === '/healthz')) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.2.0-rfx-supabase',
+      version: '6.3.0-rfx-token-c',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -770,6 +831,12 @@ async function handleHttpRequest(req, res) {
         transactions: (state.walletTransactions || []).length,
         integrity: walletIntegrityStatus.ok,
         securityConfigured: WALLET_SECURITY_CONFIGURED,
+        admobSsv: {
+          configured: ADMOB_REWARDED_AD_UNIT_ID.length > 0,
+          endpoint: '/admob/ssv',
+          pendingSessions: Object.values(state.walletAdSessions || {}).filter((item) => item?.status === 'pending').length,
+          verifiedTransactions: Object.keys(state.walletAdTransactions || {}).length,
+        },
       },
       persistence: {
         mode: SUPABASE_CONFIGURED ? 'supabase' : 'local-ephemeral',
@@ -891,6 +958,7 @@ setInterval(() => {
   for (const [key, value] of walletAuthFailures.entries()) {
     if ((value.blockedUntil || value.lastFailureAt || 0) < now - 24 * 60 * 60 * 1000) walletAuthFailures.delete(key);
   }
+  cleanupWalletAdState({ persist: true });
 }, 60 * 1000).unref?.();
 
 function normalizeId(value) {
@@ -1415,6 +1483,404 @@ function walletPublicSnapshot(id) {
     integrity: walletIntegrityStatus.ok,
   };
 }
+
+function walletAdSessionPublic(session) {
+  if (!session) return null;
+  return {
+    id: String(session.id || ''),
+    customData: `rfxad:${String(session.id || '')}`,
+    status: String(session.status || 'pending'),
+    createdAt: String(session.createdAt || ''),
+    expiresAt: String(session.expiresAt || ''),
+    verifiedAt: String(session.verifiedAt || ''),
+    transactionId: String(session.transactionId || ''),
+  };
+}
+
+function walletAdDayKey(timezoneOffsetMinutes = 0, nowMs = Date.now()) {
+  return friendUsageDayKey(timezoneOffsetMinutes, nowMs);
+}
+
+function walletAdRewardCount(id, timezoneOffsetMinutes = 0, nowMs = Date.now()) {
+  const clean = normalizeId(id);
+  const day = walletAdDayKey(timezoneOffsetMinutes, nowMs);
+  return (state.walletTransactions || []).filter((item) => (
+    item
+    && item.userId === clean
+    && item.action === 'rewarded_ad'
+    && String(item.metadata?.adDay || '') === day
+  )).length;
+}
+
+function walletAdStateSnapshot(id, timezoneOffsetMinutes = 0) {
+  const settings = normalizeWalletSettings(state.walletSettings);
+  const used = walletAdRewardCount(id, timezoneOffsetMinutes);
+  const limit = Math.max(0, Math.round(Number(settings.dailyAdLimit || 0)));
+  return {
+    enabled: settings.enabled && limit > 0 && settings.adReward > 0,
+    reward: Math.max(0, Math.round(Number(settings.adReward || 0))),
+    dailyLimit: limit,
+    dailyUsed: used,
+    dailyRemaining: Math.max(0, limit - used),
+    day: walletAdDayKey(timezoneOffsetMinutes),
+    serverVerified: true,
+  };
+}
+
+function cleanupWalletAdState({ persist = false } = {}) {
+  state.walletAdSessions = state.walletAdSessions && typeof state.walletAdSessions === 'object'
+    ? state.walletAdSessions
+    : {};
+  state.walletAdTransactions = state.walletAdTransactions && typeof state.walletAdTransactions === 'object'
+    ? state.walletAdTransactions
+    : {};
+  const now = Date.now();
+  let changed = false;
+
+  for (const session of Object.values(state.walletAdSessions)) {
+    if (!session || session.status !== 'pending') continue;
+    const expiresAt = Date.parse(session.expiresAt || '');
+    if (Number.isFinite(expiresAt) && expiresAt <= now) {
+      session.status = 'expired';
+      session.updatedAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+
+  const sessions = Object.values(state.walletAdSessions)
+    .filter(Boolean)
+    .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
+  const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
+  for (const session of sessions.slice(ADMOB_MAX_SESSION_RECORDS)) {
+    delete state.walletAdSessions[session.id];
+    changed = true;
+  }
+  for (const session of sessions) {
+    const createdAt = Date.parse(session.createdAt || '');
+    if (session.status !== 'pending' && Number.isFinite(createdAt) && createdAt < sevenDaysAgo) {
+      delete state.walletAdSessions[session.id];
+      changed = true;
+    }
+  }
+
+  const transactionEntries = Object.entries(state.walletAdTransactions)
+    .sort((a, b) => Date.parse(b[1]?.verifiedAt || 0) - Date.parse(a[1]?.verifiedAt || 0));
+  for (const [transactionId] of transactionEntries.slice(ADMOB_MAX_TRANSACTION_RECORDS)) {
+    delete state.walletAdTransactions[transactionId];
+    changed = true;
+  }
+
+  if (changed && persist) saveStateSoon();
+  return changed;
+}
+
+function walletCreateAdSession(id, timezoneOffsetMinutes = 0, deviceId = '') {
+  return withWalletMutation(async () => {
+    const clean = normalizeId(id);
+    const settings = normalizeWalletSettings(state.walletSettings);
+    const offset = normalizeTimezoneOffset(timezoneOffsetMinutes);
+    if (!settings.enabled || settings.dailyAdLimit <= 0 || settings.adReward <= 0) {
+      throw Object.assign(new Error('Token kazanma reklamları şu anda kapalı.'), { code: 'reward_ads_disabled' });
+    }
+    if (isPremiumGranted(clean) && settings.premiumUnlimited) {
+      throw Object.assign(new Error('Premium hesaplarda reklamlar tamamen kapalıdır.'), { code: 'premium_ads_disabled' });
+    }
+    if (SUPABASE_SYNC_ENABLED && !SUPABASE_CONFIGURED) {
+      throw Object.assign(new Error('Kalıcı Supabase cüzdan bağlantısı yapılandırılmadı.'), { code: 'persistent_storage_required' });
+    }
+    const adState = walletAdStateSnapshot(clean, offset);
+    if (adState.dailyRemaining <= 0) {
+      throw Object.assign(new Error('Günlük token reklam hakkı doldu.'), { code: 'daily_ad_limit', adState });
+    }
+
+    cleanupWalletAdState();
+    const existing = Object.values(state.walletAdSessions || {}).find((session) => (
+      session
+      && session.userId === clean
+      && session.status === 'pending'
+      && Date.parse(session.expiresAt || '') > Date.now()
+    ));
+    if (existing) {
+      return { session: walletAdSessionPublic(existing), adState };
+    }
+
+    const now = new Date();
+    const sessionId = `ad_${crypto.randomBytes(20).toString('hex')}`;
+    const session = {
+      id: sessionId,
+      userId: clean,
+      status: 'pending',
+      timezoneOffsetMinutes: offset,
+      deviceHash: deviceId
+        ? crypto.createHash('sha256').update(String(deviceId).slice(0, 240)).digest('hex').slice(0, 32)
+        : '',
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + ADMOB_AD_SESSION_TTL_MS).toISOString(),
+      verifiedAt: '',
+      transactionId: '',
+      ledgerTransactionId: '',
+    };
+    state.walletAdSessions[sessionId] = session;
+    try {
+      if (!await saveStateDurable()) throw new Error('Ad session could not be saved.');
+    } catch (error) {
+      delete state.walletAdSessions[sessionId];
+      writeLocalStateNow();
+      throw Object.assign(new Error('Reklam doğrulama oturumu kaydedilemedi.'), {
+        code: error.code || 'ad_session_persistence_failed',
+      });
+    }
+    return { session: walletAdSessionPublic(session), adState };
+  });
+}
+
+function decodeBase64Url(value) {
+  const clean = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = clean + '='.repeat((4 - (clean.length % 4)) % 4);
+  return Buffer.from(padded, 'base64');
+}
+
+async function fetchAdmobSsvKeys() {
+  if (admobSsvKeyCache.keys.size > 0 && Date.now() - admobSsvKeyCache.fetchedAt < ADMOB_KEY_CACHE_MS) {
+    return admobSsvKeyCache.keys;
+  }
+  let response;
+  try {
+    response = await fetch(ADMOB_SSV_KEYS_URL, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (error) {
+    if (admobSsvKeyCache.keys.size > 0) return admobSsvKeyCache.keys;
+    throw Object.assign(new Error(`SSV anahtarları alınamadı: ${error.message}`), {
+      code: 'verification_keys_unavailable',
+      statusCode: 503,
+    });
+  }
+  if (!response.ok) {
+    if (admobSsvKeyCache.keys.size > 0) return admobSsvKeyCache.keys;
+    throw Object.assign(new Error(`SSV anahtar sunucusu HTTP ${response.status} döndürdü.`), {
+      code: 'verification_keys_unavailable',
+      statusCode: 503,
+    });
+  }
+  const payload = await response.json();
+  const keys = new Map();
+  for (const item of Array.isArray(payload?.keys) ? payload.keys : []) {
+    const keyId = String(item?.keyId ?? item?.key_id ?? '').trim();
+    const pem = String(item?.pem || '').trim();
+    if (keyId && pem.includes('BEGIN PUBLIC KEY')) keys.set(keyId, pem);
+  }
+  if (keys.size === 0) {
+    throw Object.assign(new Error('SSV anahtar listesi boş veya geçersiz.'), {
+      code: 'verification_keys_unavailable',
+      statusCode: 503,
+    });
+  }
+  admobSsvKeyCache = { fetchedAt: Date.now(), keys };
+  return keys;
+}
+
+async function verifyAdmobSsvRawQuery(rawQuery) {
+  const match = String(rawQuery || '').match(/^(.*)&signature=([^&]+)&key_id=([0-9]+)$/);
+  if (!match) {
+    throw Object.assign(new Error('SSV imza alanlarının sırası veya biçimi geçersiz.'), { code: 'invalid_signature_format' });
+  }
+  const signedContent = match[1];
+  const signatureText = decodeURIComponent(match[2]);
+  const keyId = match[3];
+  const keys = await fetchAdmobSsvKeys();
+  const pem = keys.get(keyId);
+  if (!pem) {
+    // Refresh once when Google rotates keys.
+    admobSsvKeyCache = { fetchedAt: 0, keys: new Map() };
+    const refreshedKeys = await fetchAdmobSsvKeys();
+    if (!refreshedKeys.has(keyId)) {
+      throw Object.assign(new Error('SSV key_id tanınmıyor.'), { code: 'unknown_verification_key' });
+    }
+  }
+  const verificationKey = (await fetchAdmobSsvKeys()).get(keyId);
+  let signature;
+  try {
+    signature = decodeBase64Url(signatureText);
+  } catch (_) {
+    throw Object.assign(new Error('SSV imzası çözülemedi.'), { code: 'invalid_signature_encoding' });
+  }
+  const verified = crypto.verify(
+    'sha256',
+    Buffer.from(signedContent, 'utf8'),
+    verificationKey,
+    signature,
+  );
+  if (!verified) {
+    throw Object.assign(new Error('SSV imzası doğrulanamadı.'), { code: 'invalid_signature' });
+  }
+  return { signedContent, keyId };
+}
+
+function normalizedAdUnit(value) {
+  return String(value || '').trim().replace(/^ca-app-pub-[0-9]+\//, '');
+}
+
+function normalizeAdmobTimestampMs(value) {
+  let timestamp = Number(value || 0);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
+  if (timestamp < 100000000000) timestamp *= 1000; // seconds -> milliseconds
+  while (timestamp > Date.now() * 100) timestamp /= 1000; // micro/nanoseconds -> milliseconds
+  return Math.round(timestamp);
+}
+
+async function processAdmobSsvCallback(rawQuery, ip = 'unknown') {
+  await verifyAdmobSsvRawQuery(rawQuery);
+  const params = new URLSearchParams(rawQuery);
+  const transactionId = String(params.get('transaction_id') || '').trim();
+  const userId = normalizeId(params.get('user_id'));
+  const customData = String(params.get('custom_data') || '').trim();
+  const adUnit = String(params.get('ad_unit') || '').trim();
+  const timestampMs = normalizeAdmobTimestampMs(params.get('timestamp'));
+  const adNetwork = String(params.get('ad_network') || '').slice(0, 120);
+  const rewardItem = String(params.get('reward_item') || '').slice(0, 80);
+  const callbackRewardAmount = Math.max(0, Math.round(Number(params.get('reward_amount') || 0)));
+
+  if (!/^[A-Za-z0-9._:-]{8,180}$/.test(transactionId)) {
+    throw Object.assign(new Error('Geçersiz AdMob transaction_id.'), { code: 'invalid_transaction_id' });
+  }
+  if (!validId(userId)) {
+    throw Object.assign(new Error('Geçersiz SSV user_id.'), { code: 'invalid_user_id' });
+  }
+  if (!customData.startsWith('rfxad:')) {
+    throw Object.assign(new Error('Geçersiz SSV custom_data.'), { code: 'invalid_custom_data' });
+  }
+  const sessionId = customData.slice('rfxad:'.length);
+  if (!/^ad_[a-f0-9]{40}$/.test(sessionId)) {
+    throw Object.assign(new Error('Geçersiz reklam oturumu.'), { code: 'invalid_ad_session' });
+  }
+  if (normalizedAdUnit(adUnit) !== normalizedAdUnit(ADMOB_REWARDED_AD_UNIT_ID)) {
+    throw Object.assign(new Error('Beklenmeyen AdMob reklam birimi.'), { code: 'unexpected_ad_unit' });
+  }
+  if (!timestampMs || Math.abs(Date.now() - timestampMs) > ADMOB_CALLBACK_TOLERANCE_MS) {
+    throw Object.assign(new Error('SSV zaman damgası kabul edilen aralığın dışında.'), { code: 'stale_callback' });
+  }
+
+  return withWalletMutation(async () => {
+    state.walletAdSessions = state.walletAdSessions || {};
+    state.walletAdTransactions = state.walletAdTransactions || {};
+    cleanupWalletAdState();
+
+    const knownTransaction = state.walletAdTransactions[transactionId];
+    if (knownTransaction) {
+      if (knownTransaction.userId !== userId || knownTransaction.sessionId !== sessionId) {
+        throw Object.assign(new Error('AdMob transaction_id başka bir kullanıcı veya oturumda kullanılmış.'), { code: 'transaction_reuse' });
+      }
+      return {
+        statusCode: 200,
+        payload: { ok: true, duplicate: true, transactionId },
+      };
+    }
+
+    const session = state.walletAdSessions[sessionId];
+    if (!session || session.userId !== userId) {
+      throw Object.assign(new Error('Reklam oturumu bulunamadı veya kullanıcı eşleşmiyor.'), { code: 'ad_session_not_found' });
+    }
+
+    const requestId = `admob:${transactionId}`;
+    const existingLedgerTransaction = walletFindTransaction(userId, requestId);
+    if (existingLedgerTransaction) {
+      session.status = 'verified';
+      session.verifiedAt = session.verifiedAt || new Date().toISOString();
+      session.updatedAt = new Date().toISOString();
+      session.transactionId = transactionId;
+      session.ledgerTransactionId = existingLedgerTransaction.id;
+      state.walletAdTransactions[transactionId] = {
+        userId,
+        sessionId,
+        ledgerTransactionId: existingLedgerTransaction.id,
+        verifiedAt: session.verifiedAt,
+      };
+      await saveStateDurable();
+      return { statusCode: 200, payload: { ok: true, duplicate: true, transactionId } };
+    }
+
+    if (session.status === 'verified') {
+      throw Object.assign(new Error('Bu reklam oturumu daha önce farklı bir işlemle doğrulandı.'), { code: 'session_already_verified' });
+    }
+    if (session.status !== 'pending' || Date.parse(session.expiresAt || '') <= Date.now()) {
+      throw Object.assign(new Error('Reklam doğrulama oturumunun süresi doldu.'), { code: 'ad_session_expired' });
+    }
+
+    const settings = normalizeWalletSettings(state.walletSettings);
+    const offset = normalizeTimezoneOffset(session.timezoneOffsetMinutes);
+    const adState = walletAdStateSnapshot(userId, offset);
+    if (!adState.enabled || adState.dailyRemaining <= 0) {
+      throw Object.assign(new Error('Günlük token reklam hakkı doldu.'), { code: 'daily_ad_limit' });
+    }
+    const reward = Math.max(0, Math.round(Number(settings.adReward || 0)));
+    if (reward <= 0) {
+      throw Object.assign(new Error('Reklam token ödülü kapalı.'), { code: 'reward_ads_disabled' });
+    }
+
+    const ledgerTransaction = await walletCommitDeltaUnlocked({
+      id: userId,
+      delta: reward,
+      type: 'REWARD',
+      action: 'rewarded_ad',
+      requestId,
+      source: 'admob_ssv',
+      metadata: {
+        adDay: walletAdDayKey(offset),
+        timezoneOffsetMinutes: offset,
+        adNetwork,
+        adUnit: normalizedAdUnit(adUnit),
+        rewardItem,
+        callbackRewardAmount,
+        sessionId,
+      },
+    });
+
+    session.status = 'verified';
+    session.verifiedAt = new Date().toISOString();
+    session.updatedAt = session.verifiedAt;
+    session.transactionId = transactionId;
+    session.ledgerTransactionId = ledgerTransaction.id;
+    state.walletAdTransactions[transactionId] = {
+      userId,
+      sessionId,
+      ledgerTransactionId: ledgerTransaction.id,
+      verifiedAt: session.verifiedAt,
+    };
+    if (!await saveStateDurable()) {
+      throw Object.assign(new Error('SSV sonuç kaydı kalıcı veritabanına yazılamadı.'), { code: 'ssv_persistence_failed', statusCode: 503 });
+    }
+
+    walletSecurityEvent('admob_ssv_reward_verified', {
+      id: userId,
+      sessionId,
+      transactionId,
+      ip,
+      reward,
+    }, 'info');
+    sendTo(userId, {
+      type: 'wallet_changed',
+      wallet: walletPublicSnapshot(userId),
+      reason: 'rewarded_ad_verified',
+      transaction: {
+        id: ledgerTransaction.id,
+        amount: ledgerTransaction.amount,
+        action: ledgerTransaction.action,
+        balanceAfter: ledgerTransaction.balanceAfter,
+        createdAt: ledgerTransaction.createdAt,
+      },
+      serverTime: new Date().toISOString(),
+    });
+    return {
+      statusCode: 200,
+      payload: { ok: true, duplicate: false, transactionId },
+    };
+  });
+}
+
 
 function walletRateLimit(key, maxCount, windowMs, blockMs = 0) {
   const now = Date.now();
@@ -2648,6 +3114,106 @@ wss.on('connection', (socket, request) => {
         requestId,
         wallet: walletPublicSnapshot(id),
         items: walletHistory(id, data.limit, data.beforeSequence),
+        serverTime: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === 'wallet_ad_session') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_ad_session');
+      if (!wallet) return;
+      const rate = walletRateLimit(`ad-session:${socketIp}:${id}`, 8, 10 * 60 * 1000, 10 * 60 * 1000);
+      if (!rate.ok) {
+        send(socket, {
+          type: 'wallet_ad_session',
+          ok: false,
+          requestId,
+          code: 'rate_limited',
+          retryAfterSeconds: rate.retryAfterSeconds,
+          message: 'Çok hızlı reklam oturumu isteği gönderildi.',
+          adState: walletAdStateSnapshot(id, data.timezoneOffsetMinutes),
+        });
+        return;
+      }
+      try {
+        const result = await walletCreateAdSession(
+          id,
+          data.timezoneOffsetMinutes,
+          data.deviceId,
+        );
+        send(socket, {
+          type: 'wallet_ad_session',
+          ok: true,
+          requestId,
+          session: result.session,
+          adState: walletAdStateSnapshot(id, data.timezoneOffsetMinutes),
+          wallet: walletPublicSnapshot(id),
+          settings: walletSettingsSnapshot(),
+          serverTime: new Date().toISOString(),
+        });
+      } catch (error) {
+        send(socket, {
+          type: 'wallet_ad_session',
+          ok: false,
+          requestId,
+          code: error.code || 'ad_session_failed',
+          message: error.message,
+          adState: error.adState || walletAdStateSnapshot(id, data.timezoneOffsetMinutes),
+          wallet: walletPublicSnapshot(id),
+          settings: walletSettingsSnapshot(),
+        });
+      }
+      return;
+    }
+
+    if (type === 'wallet_ad_status') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_ad_status');
+      if (!wallet) return;
+      const rate = walletRateLimit(`ad-status:${socketIp}:${id}`, 90, 60 * 1000, 60 * 1000);
+      if (!rate.ok) {
+        send(socket, {
+          type: 'wallet_ad_status',
+          ok: false,
+          requestId,
+          code: 'rate_limited',
+          retryAfterSeconds: rate.retryAfterSeconds,
+          message: 'Çok fazla reklam doğrulama sorgusu.',
+        });
+        return;
+      }
+      cleanupWalletAdState({ persist: true });
+      const sessionId = String(data.sessionId || '').trim();
+      let session = null;
+      if (sessionId) {
+        session = state.walletAdSessions?.[sessionId] || null;
+        if (!session || session.userId !== id) {
+          send(socket, {
+            type: 'wallet_ad_status',
+            ok: false,
+            requestId,
+            code: 'ad_session_not_found',
+            message: 'Reklam doğrulama oturumu bulunamadı.',
+            adState: walletAdStateSnapshot(id, data.timezoneOffsetMinutes),
+            wallet: walletPublicSnapshot(id),
+            settings: walletSettingsSnapshot(),
+          });
+          return;
+        }
+      }
+      const status = String(session?.status || 'none');
+      send(socket, {
+        type: 'wallet_ad_status',
+        ok: true,
+        requestId,
+        status,
+        sessionStatus: status,
+        verified: status === 'verified',
+        session: walletAdSessionPublic(session),
+        adState: walletAdStateSnapshot(id, data.timezoneOffsetMinutes),
+        wallet: walletPublicSnapshot(id),
+        settings: walletSettingsSnapshot(),
         serverTime: new Date().toISOString(),
       });
       return;
@@ -4247,7 +4813,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.2-rfx-supabase running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.3-rfx-token-c running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
