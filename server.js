@@ -226,6 +226,7 @@ function defaultWalletSettings() {
     dailyAdLimit: 3,
     adReward: 100,
     prices: {
+      game_readiness: 10,
       device_health: 10,
       battery_charge_lab: 10,
       display_doctor: 10,
@@ -233,11 +234,19 @@ function defaultWalletSettings() {
       sensor_studio: 10,
       storage_insight: 15,
       gamer_break_coach: 5,
+      sound_booster: 20,
+      virtual_ram: 25,
+      thermal_guard: 15,
+      game_cleaner: 20,
       touch_lab: 15,
       gyro_test: 15,
       network_stability: 20,
       connectivity_center: 20,
       relaxbench: 25,
+      gaming_extreme: 100,
+      app_lock: 75,
+      winsimpro: 100,
+      shizuku_tools: 100,
       optimize_normal: 30,
       optimize_advanced: 50,
       wide_optimization: 50,
@@ -905,7 +914,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.5.0-rfx-token-e',
+      version: '6.6.0-rfx-ui-tools',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -6155,7 +6164,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.5.0-rfx-token-e running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.6.0-rfx-ui-tools running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
