@@ -461,6 +461,9 @@ function renderWallet() {
   const events = snapshot.walletSecurityEvents || [];
   const settings = snapshot.walletSettings || {};
   const integrity = snapshot.walletIntegrity || {};
+  const securityReviews = snapshot.securityReviews || [];
+  const pendingSecurityReviews = securityReviews.filter(item => item.status === 'pending');
+  const playIntegrity = snapshot.playIntegrity || {};
   if (!selectedWalletId && wallets.length) selectedWalletId = wallets[0].id;
   const selected = wallets.find(item => item.id === selectedWalletId) || null;
   const totalBalance = wallets.reduce((sum, item) => sum + Number(item.balance || 0), 0);
@@ -472,6 +475,8 @@ function renderWallet() {
       ${statCard('Dolaşımdaki token', fmtToken(totalBalance), settings.currencyName || 'RFX Token', 'blue')}
       ${statCard('İşlem defteri', transactions.length, `Son sıra: ${escapeHtml(integrity.sequence || 0)}`, 'orange')}
       ${statCard('Defter bütünlüğü', integrity.ok ? 'DOĞRULANDI' : 'DİKKAT', integrity.code || '—', integrity.ok ? 'green' : 'red')}
+      ${statCard('Güvenlik incelemesi', pendingSecurityReviews.length, `${securityReviews.length} toplam kayıt`, pendingSecurityReviews.length ? 'red' : 'green')}
+      ${statCard('Play Integrity', String(playIntegrity.mode || 'off').toUpperCase(), playIntegrity.configured ? 'Bağlı' : 'Yayın ayarı bekliyor', playIntegrity.configured ? 'green' : 'orange')}
     </div>
 
     <div class="section-head"><div><h3>Cüzdan yönetimi</h3><p>Bakiye, kilit ve kullanıcı işlem geçmişi</p></div><input id="walletSearch" class="search" placeholder="RelaxFPS ID ara"></div>
@@ -497,7 +502,10 @@ function renderWallet() {
     <div class="section-head"><div><h3>Son token işlemleri</h3><p>Sunucu tarafından imzalanmış işlem özeti</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Zaman</th><th>Kullanıcı</th><th>Tür</th><th>İşlem</th><th>Miktar</th><th>Son bakiye</th></tr></thead><tbody>${transactions.map(walletTransactionRow).join('') || '<tr><td colspan="6">Henüz işlem yok.</td></tr>'}</tbody></table></div>
 
-    <div class="section-head"><div><h3>Güvenlik olayları</h3><p>Hatalı anahtar, tekrar saldırısı ve hız sınırı kayıtları</p></div></div>
+    <div class="section-head"><div><h3>Play Integrity inceleme kuyruğu</h3><p>Riskli cihaz ve hesaplar yalnız yönetici kararıyla kalıcı olarak banlanır</p></div></div>
+    <div id="securityReviewTable" class="table-wrap"><table><thead><tr><th>Zaman</th><th>Kullanıcı</th><th>Risk</th><th>Nedenler</th><th>Durum</th><th>İşlem</th></tr></thead><tbody>${securityReviews.map(securityReviewRow).join('') || '<tr><td colspan="6">Güvenlik inceleme kaydı yok.</td></tr>'}</tbody></table></div>
+
+    <div class="section-head"><div><h3>Güvenlik olayları</h3><p>Hatalı anahtar, tekrar saldırısı, Play Integrity ve hız sınırı kayıtları</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Zaman</th><th>Seviye</th><th>Olay</th><th>Ayrıntı</th></tr></thead><tbody>${events.map(walletSecurityRow).join('') || '<tr><td colspan="4">Güvenlik olayı yok.</td></tr>'}</tbody></table></div>`;
 
   $('#walletRows')?.addEventListener('click', event => {
@@ -546,6 +554,33 @@ function renderWallet() {
       toast(result.integrity?.ok ? 'Token işlem defteri doğrulandı.' : 'İşlem defteri doğrulanamadı.', !result.integrity?.ok);
     } catch (error) { toast(error.message, true); }
     finally { setBusy(button, false); }
+  });
+
+  $('#securityReviewTable')?.addEventListener('click', async event => {
+    const button = event.target.closest('button[data-review-action]');
+    if (!button) return;
+    const reviewId = button.dataset.reviewId;
+    const action = button.dataset.reviewAction;
+    const label = action === 'ban' ? 'kalıcı ban' : action === 'lock' ? 'geçici kilit' : action === 'approve' ? 'onay ve risk sıfırlama' : 'kapatma';
+    const execute = async () => {
+      setBusy(button, true);
+      try {
+        await request('admin_security_review_action', {
+          reviewId,
+          action,
+          minutes: action === 'lock' ? 60 : undefined,
+          reason: action === 'lock' ? 'Token E yönetici güvenlik incelemesi' : undefined,
+        });
+        await refreshSnapshot();
+        toast(`Güvenlik incelemesi: ${label} tamamlandı.`);
+      } catch (error) { toast(error.message, true); }
+      finally { setBusy(button, false); }
+    };
+    if (action === 'ban') {
+      confirmAction('Kalıcı ban uygula', 'Bu kullanıcı kalıcı olarak banlansın mı?', execute);
+    } else {
+      await execute();
+    }
   });
 }
 
@@ -606,6 +641,15 @@ function walletTransactionRow(item) {
 function walletSecurityRow(item) {
   const severity = item.severity === 'high' ? 'bad' : item.severity === 'info' ? 'ok' : 'warn';
   return `<tr><td>${escapeHtml(fmtDate(item.time))}</td><td><span class="badge ${severity}">${escapeHtml(item.severity || 'warning')}</span></td><td>${escapeHtml(item.event)}</td><td class="code">${escapeHtml(JSON.stringify(item.details || {}))}</td></tr>`;
+}
+
+function securityReviewRow(item) {
+  const pendingReview = item.status === 'pending';
+  const reasons = Array.isArray(item.reasons) ? item.reasons.join(', ') : (item.reason || '—');
+  const actions = pendingReview
+    ? `<div class="actions"><button class="primary" data-review-id="${escapeHtml(item.id)}" data-review-action="approve">Onayla</button><button class="ghost" data-review-id="${escapeHtml(item.id)}" data-review-action="lock">1 saat kilitle</button><button class="danger" data-review-id="${escapeHtml(item.id)}" data-review-action="ban">Kalıcı ban</button><button class="ghost" data-review-id="${escapeHtml(item.id)}" data-review-action="dismiss">Kapat</button></div>`
+    : `<span class="muted">${escapeHtml(item.resolution || 'Çözüldü')}</span>`;
+  return `<tr><td>${escapeHtml(fmtDate(item.updatedAt || item.createdAt))}</td><td class="code">${escapeHtml(item.userId || '—')}</td><td><span class="badge ${Number(item.score || 0) >= 75 ? 'bad' : 'warn'}">${escapeHtml(item.score || 0)}</span></td><td>${escapeHtml(reasons)}</td><td><span class="badge ${pendingReview ? 'warn' : 'ok'}">${pendingReview ? 'BEKLİYOR' : 'ÇÖZÜLDÜ'}</span></td><td>${actions}</td></tr>`;
 }
 
 function renderAppControl() {
