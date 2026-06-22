@@ -1007,8 +1007,8 @@ const DAILY_WHEEL_REWARDS = [
   { id: 'retry', label: 'Tekrar dene', wheelLabel: 'TEKRAR\nDENE', weight: 40, kind: 'retry' },
   { id: 'shizuku_1d', label: '1 günlük Shizuku Tools erişimi', wheelLabel: 'SHIZUKU\n1 GÜN', weight: 2, kind: 'grant' },
   { id: 'discount_40', label: 'Premium ilk ay %40 indirim kodu', wheelLabel: '%40\nİNDİRİM', weight: 2, kind: 'code' },
-  // Kullanıcının verdiği oranlar %80 ettiği için kalan %20, düşük riskli reklamsız kullanım ödülüne ayrıldı.
-  { id: 'ads_6h', label: '6 saat reklamsız kullanım', wheelLabel: '6 SAAT\nREKLAMSIZ', weight: 20, kind: 'grant' },
+  // Kalan %20 olasılık boş dilimdir; ödül vermez ve 24 saatlik bekleme süresini başlatır.
+  { id: 'empty', label: 'Boş', wheelLabel: 'BOŞ', weight: 20, kind: 'empty' },
 ];
 
 function dailyWheelRecord(id) {
@@ -1207,7 +1207,6 @@ function dailyWheelSnapshot(id) {
       onlineBonusUntil: Number(grants.onlineBonusUntil || 0) > now ? new Date(Number(grants.onlineBonusUntil)).toISOString() : '',
       winSimUntil: Number(grants.winSimUntil || 0) > now ? new Date(Number(grants.winSimUntil)).toISOString() : '',
       shizukuUntil: Number(grants.shizukuUntil || 0) > now ? new Date(Number(grants.shizukuUntil)).toISOString() : '',
-      adsUntil: Number(grants.adsUntil || 0) > now ? new Date(Number(grants.adsUntil)).toISOString() : '',
     },
     premiumDiscount: activePremiumDiscount(clean),
     rewards: DAILY_WHEEL_REWARDS.map(({ id, label, wheelLabel, weight }) => ({ id, label, wheelLabel, weight })),
@@ -1230,8 +1229,6 @@ function applyDailyWheelReward(id, reward) {
     grants.winSimUntil = Math.max(now, Number(grants.winSimUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
   } else if (reward.id === 'shizuku_1d') {
     grants.shizukuUntil = Math.max(now, Number(grants.shizukuUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
-  } else if (reward.id === 'ads_6h') {
-    grants.adsUntil = Math.max(now, Number(grants.adsUntil || 0)) + 6 * 60 * 60 * 1000;
   } else if (reward.kind === 'code') {
     const created = createWheelPromoCode(clean, reward);
     code = created.code;
@@ -1483,6 +1480,7 @@ wss.on('connection', (socket) => {
         code,
         reward,
         premiumGrant,
+        serverTime: new Date().toISOString(),
         message: reward.label || 'Kod başarıyla kullanıldı.',
       });
       return;
@@ -1940,6 +1938,7 @@ wss.on('connection', (socket) => {
         profile: publicProfile(id),
         premiumGrant: isPremiumGranted(id),
         friendUsage: usage,
+        serverTime: new Date().toISOString(),
       });
       sendFriendsList(socket, id);
       send(socket, { type: 'groups_list', id, groups: groupsForUser(id), time: new Date().toISOString() });
