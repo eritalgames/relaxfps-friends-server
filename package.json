@@ -1,7 +1,7 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "6.0.0",
-  "description": "RELAXFPS WebSocket backend with secure browser-based Admin Studio, friends, groups, messaging, relay voice, promos, wheel rewards and persistent usage tracking",
+  "version": "6.1.0",
+  "description": "RELAXFPS WebSocket backend with secure RFX Token wallet, HMAC chained transaction ledger, Admin Studio, friends, groups, messaging and persistent usage tracking",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

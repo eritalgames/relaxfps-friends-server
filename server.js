@@ -13,8 +13,30 @@ const ADMIN_SESSION_SECRET = String(process.env.RELAXFPS_ADMIN_SESSION_SECRET ||
 const ADMIN_LOGIN_MAX_ATTEMPTS = Math.max(3, Math.min(Number(process.env.RELAXFPS_ADMIN_LOGIN_MAX_ATTEMPTS || 5), 20));
 const ADMIN_LOGIN_BLOCK_MINUTES = Math.max(1, Math.min(Number(process.env.RELAXFPS_ADMIN_LOGIN_BLOCK_MINUTES || 15), 1440));
 
+// RFX Token ledger security. Set RELAXFPS_WALLET_LEDGER_SECRET to a stable,
+// high-entropy value in production. ADMIN_SESSION_SECRET is used only as a
+// compatibility fallback so existing deployments do not fail to boot.
+const WALLET_LEDGER_SECRET_SOURCE = String(
+  process.env.RELAXFPS_WALLET_LEDGER_SECRET || ADMIN_SESSION_SECRET || '',
+);
+const WALLET_LEDGER_SECRET = crypto.createHash('sha256')
+  .update(`RELAXFPS:RFX:TOKEN:${WALLET_LEDGER_SECRET_SOURCE}`, 'utf8')
+  .digest();
+const WALLET_LEDGER_KEY_ID = crypto.createHash('sha256')
+  .update(WALLET_LEDGER_SECRET)
+  .digest('hex')
+  .slice(0, 16);
+const WALLET_SECURITY_CONFIGURED = String(process.env.RELAXFPS_WALLET_LEDGER_SECRET || '').length >= 32;
+const WALLET_MAX_TRANSACTIONS = 50000;
+const WALLET_MAX_SECURITY_EVENTS = 5000;
+const WALLET_MAX_REQUEST_INDEX = 30000;
+const WALLET_MAX_BALANCE = 1000000000;
+
 const adminSessions = new Map(); // token -> {createdAt, expiresAt, lastUsedAt, ip, userAgent}
 const adminLoginAttempts = new Map(); // ip -> {count, blockedUntil, lastAttemptAt}
+const walletRateLimits = new Map(); // composite key -> {count, windowStartedAt, blockedUntil}
+const walletAuthFailures = new Map(); // ip + RelaxFPS ID -> temporary auth throttle
+let walletIntegrityStatus = { ok: true, code: 'not_checked', checkedAt: '' };
 
 const httpServer = http.createServer((req, res) => {
   handleHttpRequest(req, res).catch((error) => {
@@ -70,6 +92,66 @@ function normalizeAppSettings(value) {
   return { ...defaultAppSettings(), ...(value && typeof value === 'object' ? value : {}) };
 }
 
+function defaultWalletSettings() {
+  return {
+    enabled: true,
+    currencyName: 'RFX Token',
+    welcomeBonus: 500,
+    premiumUnlimited: true,
+    dailyAdLimit: 3,
+    adReward: 100,
+    prices: {
+      device_health: 10,
+      battery_charge_lab: 10,
+      display_doctor: 10,
+      audio_haptic_lab: 10,
+      sensor_studio: 10,
+      storage_insight: 15,
+      gamer_break_coach: 5,
+      touch_lab: 15,
+      gyro_test: 15,
+      network_stability: 20,
+      connectivity_center: 20,
+      relaxbench: 25,
+      optimize_normal: 30,
+      optimize_advanced: 50,
+      wide_optimization: 50,
+      thermal_pro: 75,
+      latency_optimizer: 75,
+      server_10m: 50,
+      server_30m: 100,
+      server_2h: 250,
+      server_24h: 500,
+      premium_tool_trial: 250,
+    },
+    updatedAt: '',
+  };
+}
+
+function normalizeWalletSettings(value) {
+  const incoming = value && typeof value === 'object' ? value : {};
+  const defaults = defaultWalletSettings();
+  const incomingPrices = incoming.prices && typeof incoming.prices === 'object' ? incoming.prices : {};
+  const prices = { ...defaults.prices };
+  for (const [key, rawValue] of Object.entries(incomingPrices)) {
+    const cleanKey = String(key || '').trim().toLowerCase().replace(/[^a-z0-9_:-]/g, '').slice(0, 80);
+    const amount = Math.round(Number(rawValue || 0));
+    if (cleanKey && Number.isFinite(amount) && amount >= 0 && amount <= 10000000) prices[cleanKey] = amount;
+  }
+  return {
+    ...defaults,
+    ...incoming,
+    enabled: incoming.enabled !== false,
+    currencyName: String(incoming.currencyName || defaults.currencyName).slice(0, 40),
+    welcomeBonus: Math.max(0, Math.min(Math.round(Number(incoming.welcomeBonus ?? defaults.welcomeBonus)), 1000000)),
+    premiumUnlimited: incoming.premiumUnlimited !== false,
+    dailyAdLimit: Math.max(0, Math.min(Math.round(Number(incoming.dailyAdLimit ?? defaults.dailyAdLimit)), 100)),
+    adReward: Math.max(0, Math.min(Math.round(Number(incoming.adReward ?? defaults.adReward)), 1000000)),
+    prices,
+    updatedAt: String(incoming.updatedAt || ''),
+  };
+}
+
 const state = {
   profiles: {}, // id -> {id,name,lastSeen}
   friendships: {}, // id -> [friendId]
@@ -100,6 +182,15 @@ const state = {
   flashOffers: {}, // RelaxFPS ID -> persistent 3-day flash offer schedule
   cloudBackups: {}, // RelaxFPS ID -> {keyHash,backup,createdAt,updatedAt,sizeBytes,version}
   communitySignals: {}, // RelaxFPS ID -> anonymized aggregate device/session signal
+  wallets: {}, // RelaxFPS ID -> server-authoritative RFX Token wallet
+  walletTransactions: [], // append-only, HMAC chained token ledger
+  walletRequestIndex: {}, // userId:requestId -> transactionId, prevents duplicate spending
+  walletSecurityEvents: [], // suspicious wallet activity and integrity warnings
+  walletSettings: defaultWalletSettings(),
+  walletLedgerHead: '',
+  walletLedgerSequence: 0,
+  walletLedgerAnchor: { sequence: 0, hash: 'GENESIS' },
+  walletLedgerKeyId: '',
 };
 
 function loadState() {
@@ -133,6 +224,17 @@ function loadState() {
       state.flashOffers = state.flashOffers || {};
       state.cloudBackups = state.cloudBackups || {};
       state.communitySignals = state.communitySignals || {};
+      state.wallets = state.wallets && typeof state.wallets === 'object' ? state.wallets : {};
+      state.walletTransactions = Array.isArray(state.walletTransactions) ? state.walletTransactions : [];
+      state.walletRequestIndex = state.walletRequestIndex && typeof state.walletRequestIndex === 'object' ? state.walletRequestIndex : {};
+      state.walletSecurityEvents = Array.isArray(state.walletSecurityEvents) ? state.walletSecurityEvents : [];
+      state.walletSettings = normalizeWalletSettings(state.walletSettings);
+      state.walletLedgerHead = String(state.walletLedgerHead || '');
+      state.walletLedgerSequence = Math.max(0, Math.round(Number(state.walletLedgerSequence || 0)));
+      state.walletLedgerAnchor = state.walletLedgerAnchor && typeof state.walletLedgerAnchor === 'object'
+        ? state.walletLedgerAnchor
+        : { sequence: 0, hash: 'GENESIS' };
+      state.walletLedgerKeyId = String(state.walletLedgerKeyId || '');
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -153,10 +255,18 @@ function adminAudit(action, detail = {}) {
 }
 
 function saveStateNow() {
+  const tempFile = `${DATA_FILE}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    fs.writeFileSync(tempFile, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tempFile, DATA_FILE);
+    return true;
   } catch (error) {
+    try {
+      if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    } catch (_) {}
     console.warn('[STATE] Could not save data file:', error.message);
+    return false;
   }
 }
 
@@ -351,9 +461,16 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.0.0-web-admin',
+      version: '6.1.0-rfx-wallet',
       online: onlineIds().length,
       adminStudio: true,
+      wallet: {
+        enabled: normalizeWalletSettings(state.walletSettings).enabled,
+        wallets: Object.keys(state.wallets || {}).length,
+        transactions: (state.walletTransactions || []).length,
+        integrity: walletIntegrityStatus.ok,
+        securityConfigured: WALLET_SECURITY_CONFIGURED,
+      },
       time: new Date().toISOString(),
     });
     return;
@@ -456,6 +573,12 @@ setInterval(() => {
   }
   for (const [ip, attempt] of adminLoginAttempts.entries()) {
     if ((attempt.blockedUntil || attempt.lastAttemptAt || 0) < now - 24 * 60 * 60 * 1000) adminLoginAttempts.delete(ip);
+  }
+  for (const [key, value] of walletRateLimits.entries()) {
+    if ((value.blockedUntil || value.windowStartedAt || 0) < now - 60 * 60 * 1000) walletRateLimits.delete(key);
+  }
+  for (const [key, value] of walletAuthFailures.entries()) {
+    if ((value.blockedUntil || value.lastFailureAt || 0) < now - 24 * 60 * 60 * 1000) walletAuthFailures.delete(key);
   }
 }, 60 * 1000).unref?.();
 
@@ -844,6 +967,543 @@ function isPremiumGranted(id) {
   return item;
 }
 
+
+function stableJson(value) {
+  if (value === null || value === undefined) return 'null';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizeWalletKey(value) {
+  return String(value || '').trim();
+}
+
+function validWalletKey(value) {
+  const clean = normalizeWalletKey(value);
+  return clean.length >= 32 && clean.length <= 256 && /^[A-Za-z0-9_.:-]+$/.test(clean);
+}
+
+function walletCredentialHash(value, purpose) {
+  return crypto.createHmac('sha256', WALLET_LEDGER_SECRET)
+    .update(`${String(purpose || 'credential')}:${String(value || '')}`, 'utf8')
+    .digest('hex');
+}
+
+function walletKeyMatches(wallet, walletKey) {
+  if (!wallet || !wallet.walletKeyHash || !validWalletKey(walletKey)) return false;
+  return secureStringEqual(wallet.walletKeyHash, walletCredentialHash(normalizeWalletKey(walletKey), 'wallet-key'));
+}
+
+function walletRecoveryMatches(wallet, recoveryKey) {
+  if (!wallet || !wallet.recoveryKeyHash || !validRecoveryKey(recoveryKey)) return false;
+  return secureStringEqual(wallet.recoveryKeyHash, walletCredentialHash(normalizeRecoveryKey(recoveryKey), 'wallet-recovery'));
+}
+
+function normalizeWalletDeviceId(value) {
+  return String(value || '').trim().slice(0, 240);
+}
+
+function walletDeviceHash(value) {
+  const clean = normalizeWalletDeviceId(value);
+  if (!clean) return '';
+  return walletCredentialHash(clean, 'wallet-device').slice(0, 40);
+}
+
+function walletActionKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9_:-]/g, '').slice(0, 80);
+}
+
+function validWalletRequestId(value) {
+  const clean = String(value || '').trim();
+  return clean.length >= 12 && clean.length <= 160 && /^[A-Za-z0-9_.:-]+$/.test(clean);
+}
+
+function normalizeWalletMetadata(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  let serialized;
+  try {
+    serialized = stableJson(value);
+  } catch (_) {
+    return {};
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > 2048) return { truncated: true };
+  const clean = {};
+  for (const [key, raw] of Object.entries(value).slice(0, 24)) {
+    const cleanKey = String(key || '').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 60);
+    if (!cleanKey) continue;
+    if (typeof raw === 'string') clean[cleanKey] = raw.slice(0, 240);
+    else if (typeof raw === 'number' && Number.isFinite(raw)) clean[cleanKey] = raw;
+    else if (typeof raw === 'boolean') clean[cleanKey] = raw;
+  }
+  return clean;
+}
+
+function walletSettingsSnapshot() {
+  const settings = normalizeWalletSettings(state.walletSettings);
+  return {
+    enabled: settings.enabled,
+    currencyName: settings.currencyName,
+    welcomeBonus: settings.welcomeBonus,
+    premiumUnlimited: settings.premiumUnlimited,
+    dailyAdLimit: settings.dailyAdLimit,
+    adReward: settings.adReward,
+    prices: { ...settings.prices },
+    updatedAt: settings.updatedAt || '',
+  };
+}
+
+function walletRecord(id) {
+  const clean = normalizeId(id);
+  return validId(clean) && state.wallets ? state.wallets[clean] || null : null;
+}
+
+function walletIsLocked(wallet) {
+  if (!wallet) return null;
+  if (wallet.locked === true && !wallet.lockedUntil) {
+    return { locked: true, reason: wallet.lockReason || 'Token işlemleri yönetici tarafından durduruldu.', until: '' };
+  }
+  if (wallet.lockedUntil) {
+    const untilMs = Date.parse(wallet.lockedUntil);
+    if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+      return { locked: true, reason: wallet.lockReason || 'Token işlemleri geçici olarak durduruldu.', until: wallet.lockedUntil };
+    }
+    wallet.locked = false;
+    wallet.lockedUntil = '';
+    wallet.lockReason = '';
+    saveStateSoon();
+  }
+  return null;
+}
+
+function walletPublicSnapshot(id) {
+  const clean = normalizeId(id);
+  const wallet = walletRecord(clean);
+  const premium = !!isPremiumGranted(clean);
+  const settings = normalizeWalletSettings(state.walletSettings);
+  const lock = walletIsLocked(wallet);
+  return {
+    id: clean,
+    enrolled: !!wallet,
+    balance: wallet ? Math.max(0, Math.round(Number(wallet.balance || 0))) : 0,
+    unlimited: premium && settings.premiumUnlimited,
+    displayBalance: premium && settings.premiumUnlimited ? '∞' : String(wallet ? Math.max(0, Math.round(Number(wallet.balance || 0))) : 0),
+    currencyName: settings.currencyName,
+    welcomeGranted: !!wallet?.welcomeGranted,
+    locked: !!lock,
+    lockReason: lock?.reason || '',
+    lockedUntil: lock?.until || '',
+    createdAt: wallet?.createdAt || '',
+    updatedAt: wallet?.updatedAt || '',
+    lastTransactionId: wallet?.lastTransactionId || '',
+    integrity: walletIntegrityStatus.ok,
+  };
+}
+
+function walletRateLimit(key, maxCount, windowMs, blockMs = 0) {
+  const now = Date.now();
+  const cleanKey = String(key || '').slice(0, 320);
+  const current = walletRateLimits.get(cleanKey) || { count: 0, windowStartedAt: now, blockedUntil: 0 };
+  if (current.blockedUntil > now) {
+    return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil((current.blockedUntil - now) / 1000)) };
+  }
+  if (now - current.windowStartedAt >= windowMs) {
+    current.count = 0;
+    current.windowStartedAt = now;
+    current.blockedUntil = 0;
+  }
+  current.count += 1;
+  if (current.count > maxCount) {
+    if (blockMs > 0) current.blockedUntil = now + blockMs;
+    walletRateLimits.set(cleanKey, current);
+    return {
+      ok: false,
+      retryAfterSeconds: Math.max(1, Math.ceil(((current.blockedUntil || current.windowStartedAt + windowMs) - now) / 1000)),
+    };
+  }
+  walletRateLimits.set(cleanKey, current);
+  return { ok: true, remaining: Math.max(0, maxCount - current.count) };
+}
+
+function walletSecurityEvent(event, details = {}, severity = 'warning') {
+  state.walletSecurityEvents = Array.isArray(state.walletSecurityEvents) ? state.walletSecurityEvents : [];
+  const item = {
+    id: `wse-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+    event: String(event || 'unknown').slice(0, 100),
+    severity: String(severity || 'warning').slice(0, 20),
+    details: normalizeWalletMetadata(details),
+    time: new Date().toISOString(),
+  };
+  state.walletSecurityEvents.push(item);
+  if (state.walletSecurityEvents.length > WALLET_MAX_SECURITY_EVENTS) {
+    state.walletSecurityEvents = state.walletSecurityEvents.slice(-WALLET_MAX_SECURITY_EVENTS);
+  }
+  saveStateSoon();
+  return item;
+}
+
+function walletAuthFailure(ip, id, reason) {
+  const key = `${String(ip || 'unknown').slice(0, 120)}:${normalizeId(id)}`;
+  const now = Date.now();
+  const current = walletAuthFailures.get(key) || { count: 0, firstFailureAt: now, lastFailureAt: now, blockedUntil: 0 };
+  if (now - current.firstFailureAt > 10 * 60 * 1000) {
+    current.count = 0;
+    current.firstFailureAt = now;
+    current.blockedUntil = 0;
+  }
+  current.count += 1;
+  current.lastFailureAt = now;
+  if (current.count >= 8) current.blockedUntil = now + 15 * 60 * 1000;
+  walletAuthFailures.set(key, current);
+  walletSecurityEvent('wallet_auth_failed', { id: normalizeId(id), ip: String(ip || 'unknown'), reason, count: current.count }, current.count >= 8 ? 'high' : 'warning');
+  return current;
+}
+
+function walletAuthThrottle(ip, id) {
+  const key = `${String(ip || 'unknown').slice(0, 120)}:${normalizeId(id)}`;
+  const current = walletAuthFailures.get(key);
+  if (!current || current.blockedUntil <= Date.now()) return { ok: true };
+  return { ok: false, retryAfterSeconds: Math.ceil((current.blockedUntil - Date.now()) / 1000) };
+}
+
+function walletClearAuthFailures(ip, id) {
+  walletAuthFailures.delete(`${String(ip || 'unknown').slice(0, 120)}:${normalizeId(id)}`);
+}
+
+function walletTransactionHash(transaction) {
+  const payload = {
+    sequence: Number(transaction.sequence || 0),
+    id: String(transaction.id || ''),
+    userId: normalizeId(transaction.userId),
+    type: String(transaction.type || ''),
+    amount: Math.round(Number(transaction.amount || 0)),
+    balanceBefore: Math.round(Number(transaction.balanceBefore || 0)),
+    balanceAfter: Math.round(Number(transaction.balanceAfter || 0)),
+    action: walletActionKey(transaction.action),
+    requestId: String(transaction.requestId || ''),
+    source: String(transaction.source || ''),
+    createdAt: String(transaction.createdAt || ''),
+    previousHash: String(transaction.previousHash || ''),
+    metadata: normalizeWalletMetadata(transaction.metadata),
+  };
+  return crypto.createHmac('sha256', WALLET_LEDGER_SECRET).update(stableJson(payload), 'utf8').digest('hex');
+}
+
+function rebuildWalletRequestIndex() {
+  const index = {};
+  for (const transaction of (state.walletTransactions || []).slice(-WALLET_MAX_REQUEST_INDEX)) {
+    if (!transaction?.userId || !transaction?.requestId) continue;
+    index[`${normalizeId(transaction.userId)}:${String(transaction.requestId)}`] = transaction.id;
+  }
+  state.walletRequestIndex = index;
+}
+
+function verifyWalletLedger() {
+  const transactions = Array.isArray(state.walletTransactions) ? state.walletTransactions : [];
+  const anchor = state.walletLedgerAnchor && typeof state.walletLedgerAnchor === 'object'
+    ? state.walletLedgerAnchor
+    : { sequence: 0, hash: 'GENESIS' };
+  if (!transactions.length) {
+    state.walletLedgerKeyId = WALLET_LEDGER_KEY_ID;
+    state.walletLedgerHead = String(anchor.hash || 'GENESIS');
+    state.walletLedgerSequence = Math.max(0, Math.round(Number(anchor.sequence || 0)));
+    rebuildWalletRequestIndex();
+    walletIntegrityStatus = { ok: true, code: 'empty_ledger', checkedAt: new Date().toISOString() };
+    return walletIntegrityStatus;
+  }
+  if (state.walletLedgerKeyId && state.walletLedgerKeyId !== WALLET_LEDGER_KEY_ID) {
+    walletIntegrityStatus = { ok: false, code: 'ledger_secret_mismatch', checkedAt: new Date().toISOString() };
+    console.error('[WALLET] Ledger secret mismatch. Wallet mutations are disabled.');
+    return walletIntegrityStatus;
+  }
+  let expectedPreviousHash = String(anchor.hash || 'GENESIS');
+  let expectedSequence = Math.max(0, Math.round(Number(anchor.sequence || 0))) + 1;
+  for (const transaction of transactions) {
+    if (Number(transaction.sequence || 0) !== expectedSequence
+      || String(transaction.previousHash || '') !== expectedPreviousHash
+      || !secureStringEqual(String(transaction.hash || ''), walletTransactionHash(transaction))) {
+      walletIntegrityStatus = {
+        ok: false,
+        code: 'ledger_integrity_failed',
+        transactionId: String(transaction.id || ''),
+        sequence: Number(transaction.sequence || 0),
+        checkedAt: new Date().toISOString(),
+      };
+      console.error(`[WALLET] Ledger integrity failed at transaction ${transaction.id || '?'} sequence ${transaction.sequence || '?'}.`);
+      return walletIntegrityStatus;
+    }
+    expectedPreviousHash = String(transaction.hash || '');
+    expectedSequence += 1;
+  }
+  state.walletLedgerKeyId = WALLET_LEDGER_KEY_ID;
+  state.walletLedgerHead = expectedPreviousHash;
+  state.walletLedgerSequence = expectedSequence - 1;
+  rebuildWalletRequestIndex();
+  walletIntegrityStatus = {
+    ok: true,
+    code: 'verified',
+    sequence: state.walletLedgerSequence,
+    checkedAt: new Date().toISOString(),
+  };
+  return walletIntegrityStatus;
+}
+
+function walletFindTransaction(id, requestId) {
+  const key = `${normalizeId(id)}:${String(requestId || '')}`;
+  const transactionId = state.walletRequestIndex?.[key];
+  if (!transactionId) return null;
+  return (state.walletTransactions || []).find((item) => item.id === transactionId) || null;
+}
+
+function walletTrimLedgerIfNeeded() {
+  state.walletTransactions = Array.isArray(state.walletTransactions) ? state.walletTransactions : [];
+  if (state.walletTransactions.length <= WALLET_MAX_TRANSACTIONS) return;
+  const removeCount = state.walletTransactions.length - WALLET_MAX_TRANSACTIONS;
+  const removed = state.walletTransactions.splice(0, removeCount);
+  const lastRemoved = removed[removed.length - 1];
+  if (lastRemoved) {
+    state.walletLedgerAnchor = {
+      sequence: Number(lastRemoved.sequence || 0),
+      hash: String(lastRemoved.hash || 'GENESIS'),
+      archivedAt: new Date().toISOString(),
+    };
+  }
+  rebuildWalletRequestIndex();
+}
+
+function walletCommitDelta({ id, delta, type, action, requestId, source, metadata = {} }) {
+  const clean = normalizeId(id);
+  const wallet = walletRecord(clean);
+  if (!wallet) throw Object.assign(new Error('RFX Token cüzdanı bulunamadı.'), { code: 'wallet_not_enrolled' });
+  if (!walletIntegrityStatus.ok) throw Object.assign(new Error('Token işlem defteri güvenlik kontrolünden geçemedi.'), { code: 'ledger_unavailable' });
+  const settings = normalizeWalletSettings(state.walletSettings);
+  if (!settings.enabled) throw Object.assign(new Error('RFX Token sistemi geçici olarak kapalı.'), { code: 'wallet_disabled' });
+  const lock = walletIsLocked(wallet);
+  if (lock) throw Object.assign(new Error(lock.reason), { code: 'wallet_locked', lockedUntil: lock.until });
+
+  const signedDelta = Math.round(Number(delta || 0));
+  if (!Number.isFinite(signedDelta) || Math.abs(signedDelta) > 10000000) {
+    throw Object.assign(new Error('Geçersiz token miktarı.'), { code: 'invalid_amount' });
+  }
+  const before = Math.max(0, Math.round(Number(wallet.balance || 0)));
+  const after = before + signedDelta;
+  if (after < 0) throw Object.assign(new Error('Yetersiz RFX Token bakiyesi.'), { code: 'insufficient_balance', balance: before, required: Math.abs(signedDelta) });
+  if (after > WALLET_MAX_BALANCE) throw Object.assign(new Error('Cüzdan üst bakiye sınırına ulaştı.'), { code: 'wallet_balance_limit' });
+
+  const previousState = {
+    balance: wallet.balance,
+    updatedAt: wallet.updatedAt,
+    lastTransactionId: wallet.lastTransactionId,
+    ledgerLength: state.walletTransactions.length,
+    ledgerHead: state.walletLedgerHead,
+    ledgerSequence: state.walletLedgerSequence,
+    requestIndexValue: state.walletRequestIndex?.[`${clean}:${requestId}`],
+    anchor: { ...(state.walletLedgerAnchor || {}) },
+  };
+
+  const sequence = Math.max(0, Math.round(Number(state.walletLedgerSequence || 0))) + 1;
+  const transaction = {
+    id: `rfx-${sequence}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}`,
+    sequence,
+    userId: clean,
+    type: String(type || 'ADJUSTMENT').slice(0, 50),
+    amount: signedDelta,
+    balanceBefore: before,
+    balanceAfter: after,
+    action: walletActionKey(action),
+    requestId: String(requestId || '').slice(0, 160),
+    source: String(source || 'server').slice(0, 80),
+    metadata: normalizeWalletMetadata(metadata),
+    createdAt: new Date().toISOString(),
+    previousHash: String(state.walletLedgerHead || state.walletLedgerAnchor?.hash || 'GENESIS'),
+  };
+  transaction.hash = walletTransactionHash(transaction);
+
+  wallet.balance = after;
+  wallet.updatedAt = transaction.createdAt;
+  wallet.lastTransactionId = transaction.id;
+  state.walletTransactions.push(transaction);
+  state.walletLedgerSequence = sequence;
+  state.walletLedgerHead = transaction.hash;
+  state.walletLedgerKeyId = WALLET_LEDGER_KEY_ID;
+  state.walletRequestIndex = state.walletRequestIndex || {};
+  if (requestId) state.walletRequestIndex[`${clean}:${requestId}`] = transaction.id;
+  walletTrimLedgerIfNeeded();
+
+  if (!saveStateNow()) {
+    wallet.balance = previousState.balance;
+    wallet.updatedAt = previousState.updatedAt;
+    wallet.lastTransactionId = previousState.lastTransactionId;
+    state.walletTransactions = state.walletTransactions.slice(0, previousState.ledgerLength);
+    state.walletLedgerHead = previousState.ledgerHead;
+    state.walletLedgerSequence = previousState.ledgerSequence;
+    state.walletLedgerAnchor = previousState.anchor;
+    if (requestId) {
+      const key = `${clean}:${requestId}`;
+      if (previousState.requestIndexValue) state.walletRequestIndex[key] = previousState.requestIndexValue;
+      else delete state.walletRequestIndex[key];
+    }
+    throw Object.assign(new Error('Token işlemi güvenli şekilde kaydedilemedi.'), { code: 'wallet_persistence_failed' });
+  }
+  return transaction;
+}
+
+function walletEnroll(id, walletKey, recoveryKey, deviceId = '') {
+  const clean = normalizeId(id);
+  if (!validId(clean) || !validWalletKey(walletKey) || !validRecoveryKey(recoveryKey)) {
+    throw Object.assign(new Error('Geçerli RelaxFPS ID, cüzdan anahtarı ve kurtarma anahtarı gerekli.'), { code: 'invalid_wallet_credentials' });
+  }
+  const existing = walletRecord(clean);
+  if (existing) {
+    if (!walletKeyMatches(existing, walletKey)) {
+      throw Object.assign(new Error('Bu RelaxFPS ID için cüzdan zaten oluşturulmuş.'), { code: 'wallet_already_enrolled' });
+    }
+    const deviceHash = walletDeviceHash(deviceId);
+    if (deviceHash) existing.devices = Array.from(new Set([...(existing.devices || []), deviceHash])).slice(-8);
+    existing.lastAccessAt = new Date().toISOString();
+    saveStateSoon();
+    return { wallet: existing, created: false, transaction: null };
+  }
+
+  const cloudRecord = (state.cloudBackups || {})[clean] || null;
+  if (!cloudRecord) {
+    throw Object.assign(
+      new Error('Cüzdan oluşturmadan önce aynı kurtarma anahtarıyla bulut yedeği etkinleştirilmeli.'),
+      { code: 'recovery_binding_required' },
+    );
+  }
+  if (!cloudBackupKeyMatches(cloudRecord, recoveryKey)) {
+    throw Object.assign(new Error('Bulut yedeğindeki kurtarma anahtarıyla eşleşmedi.'), { code: 'recovery_key_mismatch' });
+  }
+
+  const now = new Date().toISOString();
+  const deviceHash = walletDeviceHash(deviceId);
+  const wallet = {
+    id: clean,
+    balance: 0,
+    walletKeyHash: walletCredentialHash(normalizeWalletKey(walletKey), 'wallet-key'),
+    recoveryKeyHash: walletCredentialHash(normalizeRecoveryKey(recoveryKey), 'wallet-recovery'),
+    welcomeGranted: false,
+    createdAt: now,
+    updatedAt: now,
+    lastAccessAt: now,
+    lastTransactionId: '',
+    devices: deviceHash ? [deviceHash] : [],
+    locked: false,
+    lockedUntil: '',
+    lockReason: '',
+    riskScore: 0,
+  };
+  state.wallets[clean] = wallet;
+
+  const settings = normalizeWalletSettings(state.walletSettings);
+  let transaction = null;
+  try {
+    const bonus = Math.max(0, Math.round(Number(settings.welcomeBonus || 0)));
+    if (bonus > 0) {
+      transaction = walletCommitDelta({
+        id: clean,
+        delta: bonus,
+        type: 'WELCOME_BONUS',
+        action: 'wallet_enroll',
+        requestId: `welcome-${clean}`,
+        source: 'server',
+        metadata: { cloudBackupBound: !!cloudRecord },
+      });
+    } else if (!saveStateNow()) {
+      throw Object.assign(new Error('Cüzdan güvenli şekilde kaydedilemedi.'), { code: 'wallet_persistence_failed' });
+    }
+    wallet.welcomeGranted = true;
+    wallet.updatedAt = new Date().toISOString();
+    if (!saveStateNow()) throw Object.assign(new Error('Hoş geldin ödülü durumu kaydedilemedi.'), { code: 'wallet_persistence_failed' });
+  } catch (error) {
+    delete state.wallets[clean];
+    if (transaction) {
+      state.walletTransactions = state.walletTransactions.filter((item) => item.id !== transaction.id);
+      rebuildWalletRequestIndex();
+      verifyWalletLedger();
+    }
+    saveStateNow();
+    throw error;
+  }
+  walletSecurityEvent('wallet_enrolled', { id: clean, cloudBackupBound: !!cloudRecord }, 'info');
+  return { wallet, created: true, transaction };
+}
+
+function walletRecover(id, recoveryKey, newWalletKey, deviceId = '') {
+  const clean = normalizeId(id);
+  const wallet = walletRecord(clean);
+  if (!wallet) throw Object.assign(new Error('Bu RelaxFPS ID için cüzdan bulunamadı.'), { code: 'wallet_not_enrolled' });
+  if (!validRecoveryKey(recoveryKey) || !validWalletKey(newWalletKey) || !walletRecoveryMatches(wallet, recoveryKey)) {
+    throw Object.assign(new Error('Kurtarma anahtarı yanlış.'), { code: 'recovery_key_mismatch' });
+  }
+  wallet.walletKeyHash = walletCredentialHash(normalizeWalletKey(newWalletKey), 'wallet-key');
+  const deviceHash = walletDeviceHash(deviceId);
+  if (deviceHash) wallet.devices = Array.from(new Set([...(wallet.devices || []), deviceHash])).slice(-8);
+  wallet.updatedAt = new Date().toISOString();
+  wallet.lastAccessAt = wallet.updatedAt;
+  if (!saveStateNow()) throw Object.assign(new Error('Yeni cihaz anahtarı kaydedilemedi.'), { code: 'wallet_persistence_failed' });
+  walletSecurityEvent('wallet_recovered', { id: clean, deviceAdded: !!deviceHash }, 'info');
+  return wallet;
+}
+
+function walletHistory(id, limit = 50, beforeSequence = Number.MAX_SAFE_INTEGER) {
+  const clean = normalizeId(id);
+  const maxItems = Math.max(1, Math.min(Math.round(Number(limit || 50)), 200));
+  const before = Number.isFinite(Number(beforeSequence)) ? Number(beforeSequence) : Number.MAX_SAFE_INTEGER;
+  return (state.walletTransactions || [])
+    .filter((item) => normalizeId(item.userId) === clean && Number(item.sequence || 0) < before)
+    .slice(-maxItems)
+    .reverse()
+    .map((item) => ({
+      id: item.id,
+      sequence: item.sequence,
+      type: item.type,
+      amount: item.amount,
+      balanceBefore: item.balanceBefore,
+      balanceAfter: item.balanceAfter,
+      action: item.action,
+      requestId: item.requestId,
+      source: item.source,
+      metadata: item.metadata || {},
+      createdAt: item.createdAt,
+    }));
+}
+
+function walletAuthenticate(socket, ip, id, walletKey, requestId, responseType) {
+  const clean = normalizeId(id);
+  if (!validId(clean) || !currentSocketIdentityMatches(socket, clean)) {
+    send(socket, { type: responseType, ok: false, requestId, code: 'identity_required', message: 'Önce aynı RelaxFPS ID ile sunucuya bağlan.' });
+    return null;
+  }
+  const throttle = walletAuthThrottle(ip, clean);
+  if (!throttle.ok) {
+    send(socket, { type: responseType, ok: false, requestId, code: 'auth_rate_limited', retryAfterSeconds: throttle.retryAfterSeconds, message: 'Çok fazla hatalı cüzdan doğrulaması. Daha sonra tekrar dene.' });
+    return null;
+  }
+  const wallet = walletRecord(clean);
+  if (!wallet || !walletKeyMatches(wallet, walletKey)) {
+    walletAuthFailure(ip, clean, wallet ? 'invalid_wallet_key' : 'wallet_not_enrolled');
+    send(socket, { type: responseType, ok: false, requestId, code: wallet ? 'invalid_wallet_key' : 'wallet_not_enrolled', message: wallet ? 'Cüzdan anahtarı yanlış.' : 'RFX Token cüzdanı henüz oluşturulmadı.' });
+    return null;
+  }
+  walletClearAuthFailures(ip, clean);
+  wallet.lastAccessAt = new Date().toISOString();
+  return wallet;
+}
+
+// Socket identity is stored in a WeakMap so wallet helpers can verify that a
+// request cannot claim another RelaxFPS ID merely by changing JSON fields.
+const walletSocketIdentities = new WeakMap();
+function setCurrentSocketIdentity(socket, id) {
+  if (socket) walletSocketIdentities.set(socket, normalizeId(id));
+}
+function currentSocketIdentityMatches(socket, id) {
+  return walletSocketIdentities.get(socket) === normalizeId(id);
+}
+
 function publicAnnouncements() {
   const now = Date.now();
   return (state.announcements || [])
@@ -937,6 +1597,32 @@ function adminSnapshot() {
     users,
     bannedUsers,
     premiumUsers,
+    wallets: Object.values(state.wallets || {}).map((wallet) => ({
+      id: wallet.id,
+      balance: Math.max(0, Math.round(Number(wallet.balance || 0))),
+      welcomeGranted: wallet.welcomeGranted === true,
+      locked: !!walletIsLocked(wallet),
+      lockReason: wallet.lockReason || '',
+      lockedUntil: wallet.lockedUntil || '',
+      createdAt: wallet.createdAt || '',
+      updatedAt: wallet.updatedAt || '',
+      riskScore: Math.max(0, Number(wallet.riskScore || 0)),
+    })).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))),
+    walletTransactions: (state.walletTransactions || []).slice(-160).reverse().map((item) => ({
+      id: item.id,
+      sequence: item.sequence,
+      userId: item.userId,
+      type: item.type,
+      amount: item.amount,
+      balanceBefore: item.balanceBefore,
+      balanceAfter: item.balanceAfter,
+      action: item.action,
+      source: item.source,
+      createdAt: item.createdAt,
+    })),
+    walletSecurityEvents: (state.walletSecurityEvents || []).slice(-160).reverse(),
+    walletSettings: walletSettingsSnapshot(),
+    walletIntegrity: walletIntegrityStatus,
     promoCodes: Object.values(state.promoCodes || {}).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))),
     announcements: (state.announcements || []).slice().sort((a, b) => (Number(a.order || 0) - Number(b.order || 0)) || String(b.time || '').localeCompare(String(a.time || ''))),
     customPanels: (state.customPanels || []).slice().reverse(),
@@ -970,6 +1656,10 @@ function adminSnapshot() {
       promoCodes: Object.keys(state.promoCodes || {}).length,
       wheelUsers: Object.keys(state.dailyWheel || {}).length,
       activeDiscounts: Object.keys(state.premiumDiscounts || {}).length,
+      wallets: Object.keys(state.wallets || {}).length,
+      walletTransactions: (state.walletTransactions || []).length,
+      walletIntegrity: walletIntegrityStatus.ok,
+      walletSecurityConfigured: WALLET_SECURITY_CONFIGURED,
       dataFileBytes: safeFileSize(DATA_FILE),
     },
     onlineIds: onlineIds(),
@@ -1413,10 +2103,15 @@ function communityInsights(manufacturer, model) {
 }
 
 loadState();
+verifyWalletLedger();
+if (!WALLET_SECURITY_CONFIGURED) {
+  console.warn('[WALLET] RELAXFPS_WALLET_LEDGER_SECRET is not configured. Set a stable 32+ character secret before production use.');
+}
 
-wss.on('connection', (socket) => {
+wss.on('connection', (socket, request) => {
   let currentId = null;
   let adminSessionToken = null;
+  const socketIp = requestIp(request || { headers: {}, socket: socket?._socket });
 
   socket.on('message', (raw) => {
     let data;
@@ -1429,6 +2124,229 @@ wss.on('connection', (socket) => {
 
     const type = String(data.type || '');
     const requestId = String(data.requestId || '');
+
+    if (type === 'wallet_catalog') {
+      const rate = walletRateLimit(`catalog:${socketIp}`, 30, 60 * 1000, 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'wallet_catalog', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla istek gönderildi.' });
+        return;
+      }
+      send(socket, {
+        type: 'wallet_catalog',
+        ok: true,
+        requestId,
+        settings: walletSettingsSnapshot(),
+        integrity: walletIntegrityStatus.ok,
+        securityConfigured: WALLET_SECURITY_CONFIGURED,
+        serverTime: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === 'wallet_enroll') {
+      const id = normalizeId(currentId || data.id);
+      if (!validId(id) || currentId !== id) {
+        send(socket, { type: 'wallet_enroll', ok: false, requestId, code: 'identity_required', message: 'Önce geçerli RelaxFPS ID ile sunucuya bağlan.' });
+        return;
+      }
+      const rate = walletRateLimit(`enroll:${socketIp}:${id}`, 5, 60 * 60 * 1000, 30 * 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'wallet_enroll', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla cüzdan oluşturma denemesi.' });
+        return;
+      }
+      try {
+        const result = walletEnroll(id, data.walletKey, data.recoveryKey, data.deviceId);
+        setCurrentSocketIdentity(socket, id);
+        sendTo(id, {
+          type: 'wallet_changed',
+          wallet: walletPublicSnapshot(id),
+          reason: result.created ? 'wallet_enrolled' : 'wallet_connected',
+          serverTime: new Date().toISOString(),
+        });
+        send(socket, {
+          type: 'wallet_enroll',
+          ok: true,
+          requestId,
+          created: result.created,
+          wallet: walletPublicSnapshot(id),
+          welcomeTransaction: result.transaction ? {
+            id: result.transaction.id,
+            amount: result.transaction.amount,
+            balanceAfter: result.transaction.balanceAfter,
+            createdAt: result.transaction.createdAt,
+          } : null,
+          serverTime: new Date().toISOString(),
+        });
+      } catch (error) {
+        walletSecurityEvent('wallet_enroll_failed', { id, ip: socketIp, code: error.code || 'error' }, 'warning');
+        send(socket, { type: 'wallet_enroll', ok: false, requestId, code: error.code || 'wallet_enroll_failed', message: error.message });
+      }
+      return;
+    }
+
+    if (type === 'wallet_recover') {
+      const id = normalizeId(currentId || data.id);
+      if (!validId(id) || currentId !== id) {
+        send(socket, { type: 'wallet_recover', ok: false, requestId, code: 'identity_required', message: 'Önce aynı RelaxFPS ID ile sunucuya bağlan.' });
+        return;
+      }
+      const rate = walletRateLimit(`recover:${socketIp}:${id}`, 3, 24 * 60 * 60 * 1000, 60 * 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'wallet_recover', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Cüzdan kurtarma sınırına ulaşıldı.' });
+        return;
+      }
+      try {
+        walletRecover(id, data.recoveryKey, data.newWalletKey, data.deviceId);
+        setCurrentSocketIdentity(socket, id);
+        walletClearAuthFailures(socketIp, id);
+        sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: 'wallet_recovered', serverTime: new Date().toISOString() });
+        send(socket, { type: 'wallet_recover', ok: true, requestId, wallet: walletPublicSnapshot(id), serverTime: new Date().toISOString() });
+      } catch (error) {
+        walletAuthFailure(socketIp, id, error.code || 'wallet_recover_failed');
+        send(socket, { type: 'wallet_recover', ok: false, requestId, code: error.code || 'wallet_recover_failed', message: error.message });
+      }
+      return;
+    }
+
+    if (type === 'wallet_status') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_status');
+      if (!wallet) return;
+      const rate = walletRateLimit(`status:${socketIp}:${id}`, 60, 60 * 1000, 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'wallet_status', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla bakiye sorgusu.' });
+        return;
+      }
+      send(socket, { type: 'wallet_status', ok: true, requestId, wallet: walletPublicSnapshot(id), settings: walletSettingsSnapshot(), serverTime: new Date().toISOString() });
+      return;
+    }
+
+    if (type === 'wallet_history') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_history');
+      if (!wallet) return;
+      const rate = walletRateLimit(`history:${socketIp}:${id}`, 30, 60 * 1000, 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'wallet_history', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla geçmiş isteği.' });
+        return;
+      }
+      send(socket, {
+        type: 'wallet_history',
+        ok: true,
+        requestId,
+        wallet: walletPublicSnapshot(id),
+        items: walletHistory(id, data.limit, data.beforeSequence),
+        serverTime: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === 'wallet_spend') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_spend');
+      if (!wallet) return;
+      const rate = walletRateLimit(`spend:${socketIp}:${id}`, 12, 60 * 1000, 5 * 60 * 1000);
+      if (!rate.ok) {
+        walletSecurityEvent('wallet_spend_rate_limited', { id, ip: socketIp }, 'warning');
+        send(socket, { type: 'wallet_spend', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok hızlı token harcama isteği gönderildi.' });
+        return;
+      }
+      const operationId = String(data.operationId || data.requestId || requestId || '').trim();
+      const action = walletActionKey(data.action);
+      if (!validWalletRequestId(operationId)) {
+        send(socket, { type: 'wallet_spend', ok: false, requestId, code: 'invalid_operation_id', message: 'Her işlem için benzersiz ve geçerli operationId gerekli.' });
+        return;
+      }
+      const settings = normalizeWalletSettings(state.walletSettings);
+      if (!Object.prototype.hasOwnProperty.call(settings.prices, action)) {
+        walletSecurityEvent('wallet_unknown_action', { id, action, ip: socketIp }, 'warning');
+        send(socket, { type: 'wallet_spend', ok: false, requestId, code: 'unknown_action', message: 'Bu işlem sunucu fiyat listesinde bulunmuyor.' });
+        return;
+      }
+      const existing = walletFindTransaction(id, operationId);
+      if (existing) {
+        if (existing.action !== action) {
+          walletSecurityEvent('wallet_replay_action_mismatch', { id, operationId, oldAction: existing.action, newAction: action, ip: socketIp }, 'high');
+          send(socket, { type: 'wallet_spend', ok: false, requestId, code: 'request_replay_mismatch', message: 'Aynı operationId farklı bir işlemde kullanılamaz.' });
+          return;
+        }
+        send(socket, {
+          type: 'wallet_spend',
+          ok: true,
+          duplicate: true,
+          requestId,
+          transaction: {
+            id: existing.id,
+            type: existing.type,
+            amount: existing.amount,
+            balanceBefore: existing.balanceBefore,
+            balanceAfter: existing.balanceAfter,
+            action: existing.action,
+            createdAt: existing.createdAt,
+          },
+          wallet: walletPublicSnapshot(id),
+          serverTime: new Date().toISOString(),
+        });
+        return;
+      }
+      const price = Math.max(0, Math.round(Number(settings.prices[action] || 0)));
+      const unlimited = !!isPremiumGranted(id) && settings.premiumUnlimited;
+      try {
+        const transaction = walletCommitDelta({
+          id,
+          delta: unlimited ? 0 : -price,
+          type: unlimited ? 'PREMIUM_BYPASS' : 'TOOL_SPEND',
+          action,
+          requestId: operationId,
+          source: 'app',
+          metadata: { ...normalizeWalletMetadata(data.metadata), price, premium: unlimited },
+        });
+        sendTo(id, {
+          type: 'wallet_changed',
+          wallet: walletPublicSnapshot(id),
+          reason: unlimited ? 'premium_bypass' : 'token_spent',
+          transaction: {
+            id: transaction.id,
+            amount: transaction.amount,
+            action: transaction.action,
+            balanceAfter: transaction.balanceAfter,
+            createdAt: transaction.createdAt,
+          },
+          serverTime: new Date().toISOString(),
+        });
+        send(socket, {
+          type: 'wallet_spend',
+          ok: true,
+          requestId,
+          charged: !unlimited,
+          price,
+          transaction: {
+            id: transaction.id,
+            type: transaction.type,
+            amount: transaction.amount,
+            balanceBefore: transaction.balanceBefore,
+            balanceAfter: transaction.balanceAfter,
+            action: transaction.action,
+            createdAt: transaction.createdAt,
+          },
+          wallet: walletPublicSnapshot(id),
+          serverTime: new Date().toISOString(),
+        });
+      } catch (error) {
+        if (error.code === 'insufficient_balance') walletSecurityEvent('wallet_insufficient_balance', { id, action, price, balance: error.balance }, 'info');
+        send(socket, {
+          type: 'wallet_spend',
+          ok: false,
+          requestId,
+          code: error.code || 'wallet_spend_failed',
+          message: error.message,
+          balance: error.balance,
+          required: error.required || price,
+          wallet: walletPublicSnapshot(id),
+        });
+      }
+      return;
+    }
 
     if (type === 'get_public_announcements') {
       send(socket, { type: 'public_announcements', ok: true, requestId, announcements: publicAnnouncements(), time: new Date().toISOString() });
@@ -1803,6 +2721,88 @@ wss.on('connection', (socket) => {
     if (type === 'admin_snapshot') {
       if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       send(socket, { ...adminSnapshot(), requestId });
+      return;
+    }
+
+    if (type === 'admin_wallet_adjust') {
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
+      const id = normalizeId(data.id);
+      const amount = Math.round(Number(data.amount || 0));
+      const reason = String(data.reason || 'Yönetici düzeltmesi').slice(0, 240);
+      if (!validId(id) || !walletRecord(id)) {
+        send(socket, { type: 'admin_error', ok: false, requestId, message: 'Kayıtlı RFX Token cüzdanı olan geçerli bir RelaxFPS ID gerekli.' });
+        return;
+      }
+      if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > 10000000) {
+        send(socket, { type: 'admin_error', ok: false, requestId, message: 'Miktar sıfırdan farklı ve en fazla 10.000.000 olmalı.' });
+        return;
+      }
+      try {
+        const transaction = walletCommitDelta({
+          id,
+          delta: amount,
+          type: amount > 0 ? 'ADMIN_CREDIT' : 'ADMIN_DEBIT',
+          action: 'admin_adjustment',
+          requestId: `admin-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`,
+          source: 'admin',
+          metadata: { reason },
+        });
+        adminAudit('wallet_adjust', { id, amount, reason, transactionId: transaction.id });
+        sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: 'admin_adjustment', serverTime: new Date().toISOString() });
+        send(socket, { type: 'admin_wallet_adjust', ok: true, requestId, wallet: walletPublicSnapshot(id), transaction });
+      } catch (error) {
+        send(socket, { type: 'admin_error', ok: false, requestId, code: error.code || 'wallet_adjust_failed', message: error.message });
+      }
+      return;
+    }
+
+    if (type === 'admin_wallet_lock') {
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
+      const id = normalizeId(data.id);
+      const wallet = walletRecord(id);
+      if (!validId(id) || !wallet) {
+        send(socket, { type: 'admin_error', ok: false, requestId, message: 'Kayıtlı cüzdan bulunamadı.' });
+        return;
+      }
+      const locked = data.locked === true;
+      const minutes = Math.max(0, Math.min(Math.round(Number(data.minutes || 0)), 525600));
+      wallet.locked = locked;
+      wallet.lockReason = locked ? String(data.reason || 'Güvenlik kontrolü').slice(0, 240) : '';
+      wallet.lockedUntil = locked && minutes > 0 ? new Date(Date.now() + minutes * 60 * 1000).toISOString() : '';
+      wallet.updatedAt = new Date().toISOString();
+      saveStateNow();
+      walletSecurityEvent(locked ? 'wallet_admin_locked' : 'wallet_admin_unlocked', { id, minutes, reason: wallet.lockReason }, locked ? 'high' : 'info');
+      adminAudit('wallet_lock', { id, locked, minutes, reason: wallet.lockReason });
+      sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: locked ? 'wallet_locked' : 'wallet_unlocked', serverTime: new Date().toISOString() });
+      send(socket, { type: 'admin_wallet_lock', ok: true, requestId, wallet: walletPublicSnapshot(id) });
+      return;
+    }
+
+    if (type === 'admin_update_wallet_settings') {
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
+      const incoming = data.settings && typeof data.settings === 'object' ? data.settings : {};
+      const current = normalizeWalletSettings(state.walletSettings);
+      state.walletSettings = normalizeWalletSettings({
+        ...current,
+        ...incoming,
+        prices: { ...current.prices, ...(incoming.prices && typeof incoming.prices === 'object' ? incoming.prices : {}) },
+        updatedAt: new Date().toISOString(),
+      });
+      if (!saveStateNow()) {
+        send(socket, { type: 'admin_error', ok: false, requestId, message: 'Cüzdan ayarları kaydedilemedi.' });
+        return;
+      }
+      adminAudit('wallet_settings_updated', { settings: walletSettingsSnapshot() });
+      send(socket, { type: 'admin_update_wallet_settings', ok: true, requestId, settings: walletSettingsSnapshot() });
+      return;
+    }
+
+    if (type === 'admin_wallet_verify_ledger') {
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
+      const result = verifyWalletLedger();
+      if (result.ok) saveStateNow();
+      adminAudit('wallet_ledger_verified', result);
+      send(socket, { type: 'admin_wallet_verify_ledger', ok: result.ok, requestId, integrity: result });
       return;
     }
 
@@ -2207,6 +3207,7 @@ wss.on('connection', (socket) => {
 
       const wasOffline = !isOnline(id);
       currentId = id;
+      setCurrentSocketIdentity(socket, id);
       addClient(id, socket);
       const incomingName = String(data.name || '').trim();
       ensureProfile(id, incomingName && incomingName !== 'RelaxFPS User' ? incomingName : '');
@@ -2223,6 +3224,9 @@ wss.on('connection', (socket) => {
         profile: publicProfile(id),
         premiumGrant: isPremiumGranted(id),
         friendUsage: usage,
+        walletAvailable: normalizeWalletSettings(state.walletSettings).enabled,
+        walletEnrolled: !!walletRecord(id),
+        walletSecurityConfigured: WALLET_SECURITY_CONFIGURED,
         serverTime: new Date().toISOString(),
       });
       sendFriendsList(socket, id);
@@ -2741,6 +3745,7 @@ wss.on('connection', (socket) => {
   });
 
   socket.on('close', () => {
+    walletSocketIdentities.delete(socket);
     if (currentId) {
       const wentOffline = removeClient(currentId, socket);
       if (wentOffline) {
@@ -2794,7 +3799,7 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 httpServer.listen(PORT, () => {
-  console.log(`RelaxFPS Friends Server v6.0-web-admin running on ws://0.0.0.0:${PORT}`);
+  console.log(`RelaxFPS Friends Server v6.1-rfx-wallet running on ws://0.0.0.0:${PORT}`);
   console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
   if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
   if (ADMIN_TOTP_SECRET) console.log('[SECURITY] Admin TOTP is enabled.');

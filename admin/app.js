@@ -11,9 +11,6 @@ const toastEl = $('#toast');
 const connectionDot = $('#connectionDot');
 const connectionText = $('#connectionText');
 const sessionTimer = $('#sessionTimer');
-const appShell = $('.app-shell');
-const sidebarToggle = $('#sidebarToggle');
-const sidebarBackdrop = $('#sidebarBackdrop');
 
 let authToken = sessionStorage.getItem('relaxfps_admin_token') || '';
 let authExpiresAt = Number(sessionStorage.getItem('relaxfps_admin_expires_at') || 0);
@@ -23,6 +20,7 @@ let snapshot = {};
 let currentPage = 'overview';
 let contentTab = 'announcements';
 let selectedUserId = '';
+let selectedWalletId = '';
 let pending = new Map();
 let reconnectTimer = null;
 let toastTimer = null;
@@ -31,22 +29,11 @@ let announcementImageBase64 = '';
 let announcementVideoBase64 = '';
 let panelImageBase64 = '';
 
-function closeSidebar() {
-  if (window.innerWidth <= 980) appShell?.classList.remove('sidebar-open');
-}
-function toggleSidebar(force) {
-  if (!appShell) return;
-  const open = typeof force === 'boolean' ? force : !appShell.classList.contains('sidebar-open');
-  appShell.classList.toggle('sidebar-open', open);
-}
-sidebarToggle?.addEventListener('click', () => toggleSidebar());
-sidebarBackdrop?.addEventListener('click', () => closeSidebar());
-window.addEventListener('resize', () => { if (window.innerWidth > 980) closeSidebar(); });
-
 const titles = {
   overview: ['YÖNETİM MERKEZİ', 'Genel Bakış'],
   content: ['YAYIN VE İÇERİK', 'İçerik Yönetimi'],
   users: ['KULLANICI MERKEZİ', 'Kullanıcılar'],
+  wallet: ['RFX TOKEN MERKEZİ', 'RFX Token'],
   'app-control': ['UZAKTAN YÖNETİM', 'Uygulama Kontrolü'],
   feedback: ['DESTEK MERKEZİ', 'Geri Bildirim'],
   security: ['SİSTEM VE GÜVENLİK', 'Güvenlik'],
@@ -147,7 +134,6 @@ $('#loginForm').addEventListener('submit', async (event) => {
 async function enterApp() {
   loginView.classList.add('hidden');
   appView.classList.remove('hidden');
-  closeSidebar();
   await connectWebSocket();
 }
 
@@ -243,7 +229,6 @@ function forceLogin(message = '') {
   clearSession();
   try { ws?.close(); } catch (_) {}
   ws = null;
-  closeSidebar();
   appView.classList.add('hidden');
   loginView.classList.remove('hidden');
   $('#loginStatus').textContent = message || 'Yeniden giriş yapmalısın.';
@@ -269,7 +254,6 @@ $('#navList').addEventListener('click', (event) => {
   currentPage = button.dataset.page;
   $$('#navList button').forEach((item) => item.classList.toggle('active', item === button));
   renderPage();
-  closeSidebar();
 });
 
 function renderPage() {
@@ -280,6 +264,7 @@ function renderPage() {
     overview: renderOverview,
     content: renderContent,
     users: renderUsers,
+    wallet: renderWallet,
     'app-control': renderAppControl,
     feedback: renderFeedback,
     security: renderSecurity,
@@ -456,6 +441,164 @@ function bindUserActions(u){
   $('#sendDevMessage').addEventListener('click',()=>runUserAction('admin_send_developer_message',{to:u.id,title:$('#devMessageTitle').value.trim(),body:$('#devMessageBody').value.trim()},'Mesaj gönderildi.'));
 }
 async function runUserAction(type,payload,message){try{await request(type,payload);await refreshSnapshot();toast(message);}catch(e){toast(e.message,true)}}
+
+
+function fmtToken(value) {
+  return new Intl.NumberFormat('tr-TR').format(Math.round(Number(value || 0)));
+}
+
+function renderWallet() {
+  const wallets = snapshot.wallets || [];
+  const transactions = snapshot.walletTransactions || [];
+  const events = snapshot.walletSecurityEvents || [];
+  const settings = snapshot.walletSettings || {};
+  const integrity = snapshot.walletIntegrity || {};
+  if (!selectedWalletId && wallets.length) selectedWalletId = wallets[0].id;
+  const selected = wallets.find(item => item.id === selectedWalletId) || null;
+  const totalBalance = wallets.reduce((sum, item) => sum + Number(item.balance || 0), 0);
+  const lockedCount = wallets.filter(item => item.locked).length;
+
+  pageContent.innerHTML = `
+    <div class="grid stats-grid">
+      ${statCard('Kayıtlı cüzdan', wallets.length, `${lockedCount} kilitli`, 'green')}
+      ${statCard('Dolaşımdaki token', fmtToken(totalBalance), settings.currencyName || 'RFX Token', 'blue')}
+      ${statCard('İşlem defteri', transactions.length, `Son sıra: ${escapeHtml(integrity.sequence || 0)}`, 'orange')}
+      ${statCard('Defter bütünlüğü', integrity.ok ? 'DOĞRULANDI' : 'DİKKAT', integrity.code || '—', integrity.ok ? 'green' : 'red')}
+    </div>
+
+    <div class="section-head"><div><h3>Cüzdan yönetimi</h3><p>Bakiye, kilit ve kullanıcı işlem geçmişi</p></div><input id="walletSearch" class="search" placeholder="RelaxFPS ID ara"></div>
+    <div class="grid user-layout">
+      <section class="card user-list"><div id="walletRows">${wallets.map(walletRow).join('') || '<div class="empty">Henüz cüzdan yok.</div>'}</div></section>
+      <section id="walletDetail" class="card">${selected ? walletDetail(selected) : '<div class="empty">Bir cüzdan seç.</div>'}</section>
+    </div>
+
+    <div class="section-head"><div><h3>Token ekonomisi</h3><p>Hoş geldin ödülü, reklam ödülü ve sunucu fiyatları</p></div></div>
+    <form id="walletSettingsForm" class="card">
+      <div class="form-grid">
+        <label class="check-row"><input id="walletEnabled" type="checkbox" ${settings.enabled !== false ? 'checked' : ''}> Token sistemi aktif</label>
+        <label class="check-row"><input id="walletPremiumUnlimited" type="checkbox" ${settings.premiumUnlimited !== false ? 'checked' : ''}> Premium sınırsız token</label>
+        ${fieldValue('walletCurrencyName','Para birimi adı',settings.currencyName || 'RFX Token')}
+        ${fieldValue('walletWelcomeBonus','Hoş geldin ödülü',settings.welcomeBonus ?? 500,'number')}
+        ${fieldValue('walletAdReward','Reklam ödülü',settings.adReward ?? 100,'number')}
+        ${fieldValue('walletDailyAdLimit','Günlük reklam sınırı',settings.dailyAdLimit ?? 3,'number')}
+        <label class="full"><span>İşlem fiyatları (JSON)</span><textarea id="walletPrices" class="code" style="min-height:290px">${escapeHtml(JSON.stringify(settings.prices || {}, null, 2))}</textarea></label>
+        <div class="actions full"><button class="primary" type="submit">Token ayarlarını kaydet</button><button id="verifyWalletLedger" class="ghost" type="button">İşlem defterini doğrula</button></div>
+      </div>
+    </form>
+
+    <div class="section-head"><div><h3>Son token işlemleri</h3><p>Sunucu tarafından imzalanmış işlem özeti</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Zaman</th><th>Kullanıcı</th><th>Tür</th><th>İşlem</th><th>Miktar</th><th>Son bakiye</th></tr></thead><tbody>${transactions.map(walletTransactionRow).join('') || '<tr><td colspan="6">Henüz işlem yok.</td></tr>'}</tbody></table></div>
+
+    <div class="section-head"><div><h3>Güvenlik olayları</h3><p>Hatalı anahtar, tekrar saldırısı ve hız sınırı kayıtları</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Zaman</th><th>Seviye</th><th>Olay</th><th>Ayrıntı</th></tr></thead><tbody>${events.map(walletSecurityRow).join('') || '<tr><td colspan="4">Güvenlik olayı yok.</td></tr>'}</tbody></table></div>`;
+
+  $('#walletRows')?.addEventListener('click', event => {
+    const button = event.target.closest('[data-wallet-id]');
+    if (!button) return;
+    selectedWalletId = button.dataset.walletId;
+    renderWallet();
+  });
+  $('#walletSearch')?.addEventListener('input', event => {
+    const query = event.target.value.toLowerCase();
+    $$('#walletRows [data-wallet-id]').forEach(row => row.classList.toggle('hidden', !row.dataset.search.includes(query)));
+  });
+  if (selected) bindWalletActions(selected);
+
+  $('#walletSettingsForm')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = event.submitter;
+    setBusy(button, true);
+    try {
+      let prices;
+      try { prices = JSON.parse($('#walletPrices').value); }
+      catch (_) { throw new Error('İşlem fiyatları geçerli JSON olmalı.'); }
+      await request('admin_update_wallet_settings', {
+        settings: {
+          enabled: $('#walletEnabled').checked,
+          premiumUnlimited: $('#walletPremiumUnlimited').checked,
+          currencyName: $('#walletCurrencyName').value.trim(),
+          welcomeBonus: Number($('#walletWelcomeBonus').value || 0),
+          adReward: Number($('#walletAdReward').value || 0),
+          dailyAdLimit: Number($('#walletDailyAdLimit').value || 0),
+          prices,
+        },
+      });
+      await refreshSnapshot();
+      toast('RFX Token ayarları kaydedildi.');
+    } catch (error) { toast(error.message, true); }
+    finally { setBusy(button, false); }
+  });
+
+  $('#verifyWalletLedger')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    setBusy(button, true, 'Doğrulanıyor…');
+    try {
+      const result = await request('admin_wallet_verify_ledger');
+      await refreshSnapshot();
+      toast(result.integrity?.ok ? 'Token işlem defteri doğrulandı.' : 'İşlem defteri doğrulanamadı.', !result.integrity?.ok);
+    } catch (error) { toast(error.message, true); }
+    finally { setBusy(button, false); }
+  });
+}
+
+function walletRow(wallet) {
+  const search = `${wallet.id} ${wallet.balance}`.toLowerCase();
+  return `<button class="user-row ${wallet.id === selectedWalletId ? 'active' : ''}" data-wallet-id="${escapeHtml(wallet.id)}" data-search="${escapeHtml(search)}"><span><b class="code">${escapeHtml(wallet.id)}</b><small>${escapeHtml(fmtDate(wallet.updatedAt))}</small></span><span><b class="wallet-balance">◆ ${escapeHtml(fmtToken(wallet.balance))}</b>${wallet.locked ? '<span class="badge bad">KİLİTLİ</span>' : ''}</span></button>`;
+}
+
+function walletDetail(wallet) {
+  const userTransactions = (snapshot.walletTransactions || []).filter(item => item.userId === wallet.id).slice(0, 12);
+  return `<div class="section-head"><div><h3 class="code">${escapeHtml(wallet.id)}</h3><p>Sunucu esaslı RFX Token cüzdanı</p></div><span class="badge ${wallet.locked ? 'bad' : 'ok'}">${wallet.locked ? 'KİLİTLİ' : 'AKTİF'}</span></div>
+    <div class="wallet-hero"><small>GÜNCEL BAKİYE</small><strong>◆ ${escapeHtml(fmtToken(wallet.balance))}</strong></div>
+    <div class="list">${infoRow('Hoş geldin ödülü',wallet.welcomeGranted ? 'Verildi' : 'Verilmedi')}${infoRow('Oluşturulma',fmtDate(wallet.createdAt))}${infoRow('Son güncelleme',fmtDate(wallet.updatedAt))}${infoRow('Risk puanı',wallet.riskScore || 0)}${infoRow('Kilit bitişi',fmtDate(wallet.lockedUntil))}${infoRow('Kilit nedeni',wallet.lockReason || '—')}</div>
+    <hr style="border-color:var(--line);border-width:1px 0 0;margin:20px 0">
+    <div class="form-grid">
+      ${field('walletAdjustAmount','Token miktarı','number','Örn. 500 veya -100')}
+      ${field('walletAdjustReason','İşlem nedeni','text','Destek düzeltmesi')}
+      <button id="walletAdjust" class="primary full">Bakiyeyi güncelle</button>
+      ${field('walletLockMinutes','Kilit süresi (dakika)','number','0 = süresiz')}
+      ${field('walletLockReason','Kilit nedeni','text','Güvenlik kontrolü')}
+      <div class="actions full"><button id="walletLock" class="danger">Cüzdanı kilitle</button><button id="walletUnlock" class="ghost">Kilidi kaldır</button></div>
+    </div>
+    <div class="section-head"><div><h3>Son işlemleri</h3></div></div>
+    <div class="list">${userTransactions.map(item => `<div class="list-item"><div class="list-item-head"><b>${escapeHtml(item.type)}</b><span class="badge ${Number(item.amount) >= 0 ? 'ok' : 'warn'}">${Number(item.amount) >= 0 ? '+' : ''}${escapeHtml(fmtToken(item.amount))}</span></div><p>${escapeHtml(item.action || '—')} • ${escapeHtml(fmtDate(item.createdAt))}</p></div>`).join('') || '<div class="empty">İşlem yok.</div>'}</div>`;
+}
+
+function bindWalletActions(wallet) {
+  $('#walletAdjust')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    const amount = Number($('#walletAdjustAmount').value || 0);
+    if (!amount) return toast('Sıfırdan farklı bir miktar yaz.', true);
+    setBusy(button, true);
+    try {
+      await request('admin_wallet_adjust', { id: wallet.id, amount, reason: $('#walletAdjustReason').value.trim() });
+      await refreshSnapshot();
+      toast('Cüzdan bakiyesi güncellendi.');
+    } catch (error) { toast(error.message, true); }
+    finally { setBusy(button, false); }
+  });
+  $('#walletLock')?.addEventListener('click', () => confirmAction('Cüzdanı kilitle', `${wallet.id} token işlemlerine kapatılsın mı?`, async () => {
+    await request('admin_wallet_lock', { id: wallet.id, locked: true, minutes: Number($('#walletLockMinutes').value || 0), reason: $('#walletLockReason').value.trim() });
+    await refreshSnapshot();
+    toast('Cüzdan kilitlendi.');
+  }));
+  $('#walletUnlock')?.addEventListener('click', async () => {
+    try {
+      await request('admin_wallet_lock', { id: wallet.id, locked: false });
+      await refreshSnapshot();
+      toast('Cüzdan kilidi kaldırıldı.');
+    } catch (error) { toast(error.message, true); }
+  });
+}
+
+function walletTransactionRow(item) {
+  const amount = Number(item.amount || 0);
+  return `<tr><td>${escapeHtml(fmtDate(item.createdAt))}</td><td class="code">${escapeHtml(item.userId)}</td><td>${escapeHtml(item.type)}</td><td>${escapeHtml(item.action || '—')}</td><td class="${amount >= 0 ? 'token-positive' : 'token-negative'}">${amount >= 0 ? '+' : ''}${escapeHtml(fmtToken(amount))}</td><td>${escapeHtml(fmtToken(item.balanceAfter))}</td></tr>`;
+}
+function walletSecurityRow(item) {
+  const severity = item.severity === 'high' ? 'bad' : item.severity === 'info' ? 'ok' : 'warn';
+  return `<tr><td>${escapeHtml(fmtDate(item.time))}</td><td><span class="badge ${severity}">${escapeHtml(item.severity || 'warning')}</span></td><td>${escapeHtml(item.event)}</td><td class="code">${escapeHtml(JSON.stringify(item.details || {}))}</td></tr>`;
+}
 
 function renderAppControl() {
   const s = snapshot.appSettings || {};
