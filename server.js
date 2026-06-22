@@ -55,6 +55,37 @@ const ADMOB_MAX_SESSION_RECORDS = 20000;
 const ADMOB_MAX_TRANSACTION_RECORDS = 30000;
 let admobSsvKeyCache = { fetchedAt: 0, keys: new Map() };
 
+// Token D: Google Play consumable RFX packages. Purchase tokens are verified
+// and consumed only on this backend. The service-account JSON must never be
+// bundled with the Flutter application or committed to source control.
+const GOOGLE_PLAY_PACKAGE_NAME = String(
+  process.env.RELAXFPS_GOOGLE_PLAY_PACKAGE_NAME || 'com.relaxfps.gamebooster',
+).trim();
+const GOOGLE_PLAY_SCOPE = 'https://www.googleapis.com/auth/androidpublisher';
+const GOOGLE_PLAY_API_BASE_URL = String(
+  process.env.RELAXFPS_GOOGLE_PLAY_API_BASE_URL || 'https://androidpublisher.googleapis.com',
+).replace(/\/+$/g, '');
+const GOOGLE_PLAY_OAUTH_TOKEN_URL = String(
+  process.env.RELAXFPS_GOOGLE_PLAY_OAUTH_TOKEN_URL || 'https://oauth2.googleapis.com/token',
+);
+const GOOGLE_PLAY_LOCAL_TESTS_ALLOWED = String(
+  process.env.RELAXFPS_ALLOW_INSECURE_LOCAL_TESTS || 'false',
+).toLowerCase() === 'true';
+const GOOGLE_PLAY_VOIDED_SYNC_INTERVAL_MS = Math.max(
+  15 * 60 * 1000,
+  Math.min(Number(process.env.RELAXFPS_GOOGLE_PLAY_VOIDED_SYNC_MINUTES || 30) * 60 * 1000, 24 * 60 * 60 * 1000),
+);
+const GOOGLE_PLAY_MAX_PURCHASE_RECORDS = 50000;
+const GOOGLE_PLAY_TOKEN_PRODUCTS = Object.freeze({
+  relaxfps_rfx_500: { amount: 500, label: 'Başlangıç paketi' },
+  relaxfps_rfx_100000: { amount: 100000, label: 'Güç paketi' },
+  relaxfps_rfx_1000000: { amount: 1000000, label: 'Pro paket' },
+  relaxfps_rfx_10000000: { amount: 10000000, label: 'Mega paket' },
+});
+let googlePlayAccessTokenCache = { token: '', expiresAt: 0 };
+const googlePlayPurchaseLocks = new Map();
+let googlePlayVoidedSyncRunning = false;
+
 
 // Free persistent storage through Supabase. Keep the secret/service-role key
 // only in Render environment variables; never ship it in Flutter or GitHub.
@@ -249,6 +280,9 @@ const state = {
   walletSecurityEvents: [], // suspicious wallet activity and integrity warnings
   walletAdSessions: {}, // sessionId -> pending/verified rewarded-ad SSV session
   walletAdTransactions: {}, // AdMob transactionId -> user/session/ledger transaction
+  playPurchases: {}, // purchaseTokenHash -> verified Google Play consumable purchase
+  playPurchaseOrderIndex: {}, // optional orderId -> purchaseTokenHash (not used as primary key)
+  playPurchaseSync: { lastVoidedSyncAt: '', startTimeMs: 0, lastError: '' },
   walletSettings: defaultWalletSettings(),
   walletLedgerHead: '',
   walletLedgerSequence: 0,
@@ -297,6 +331,11 @@ function applyLoadedState(parsed) {
   state.walletSecurityEvents = Array.isArray(state.walletSecurityEvents) ? state.walletSecurityEvents : [];
   state.walletAdSessions = state.walletAdSessions && typeof state.walletAdSessions === 'object' ? state.walletAdSessions : {};
   state.walletAdTransactions = state.walletAdTransactions && typeof state.walletAdTransactions === 'object' ? state.walletAdTransactions : {};
+  state.playPurchases = state.playPurchases && typeof state.playPurchases === 'object' ? state.playPurchases : {};
+  state.playPurchaseOrderIndex = state.playPurchaseOrderIndex && typeof state.playPurchaseOrderIndex === 'object' ? state.playPurchaseOrderIndex : {};
+  state.playPurchaseSync = state.playPurchaseSync && typeof state.playPurchaseSync === 'object'
+    ? state.playPurchaseSync
+    : { lastVoidedSyncAt: '', startTimeMs: 0, lastError: '' };
   state.walletSettings = normalizeWalletSettings(state.walletSettings);
   state.walletLedgerHead = String(state.walletLedgerHead || '');
   state.walletLedgerSequence = Math.max(0, Math.round(Number(state.walletLedgerSequence || 0)));
@@ -822,7 +861,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.3.0-rfx-token-c',
+      version: '6.4.0-rfx-token-d',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -836,6 +875,14 @@ async function handleHttpRequest(req, res) {
           endpoint: '/admob/ssv',
           pendingSessions: Object.values(state.walletAdSessions || {}).filter((item) => item?.status === 'pending').length,
           verifiedTransactions: Object.keys(state.walletAdTransactions || {}).length,
+        },
+        googlePlay: {
+          configured: googlePlayConfigured(),
+          packageName: GOOGLE_PLAY_PACKAGE_NAME,
+          products: Object.keys(GOOGLE_PLAY_TOKEN_PRODUCTS).length,
+          purchases: Object.keys(state.playPurchases || {}).length,
+          lastVoidedSyncAt: String(state.playPurchaseSync?.lastVoidedSyncAt || ''),
+          lastVoidedSyncError: String(state.playPurchaseSync?.lastError || ''),
         },
       },
       persistence: {
@@ -1879,6 +1926,479 @@ async function processAdmobSsvCallback(rawQuery, ip = 'unknown') {
       payload: { ok: true, duplicate: false, transactionId },
     };
   });
+}
+
+function googlePlayServiceAccount() {
+  let raw = String(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON || '').trim();
+  if (!raw) {
+    const encoded = String(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_BASE64 || '').trim();
+    if (encoded) {
+      try { raw = Buffer.from(encoded, 'base64').toString('utf8'); } catch (_) { raw = ''; }
+    }
+  }
+  let parsed = null;
+  if (raw) {
+    try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+  }
+  const clientEmail = String(parsed?.client_email || process.env.GOOGLE_PLAY_CLIENT_EMAIL || '').trim();
+  const privateKey = String(parsed?.private_key || process.env.GOOGLE_PLAY_PRIVATE_KEY || '')
+    .replace(/\\n/g, '\n')
+    .trim();
+  return clientEmail && privateKey.includes('BEGIN PRIVATE KEY')
+    ? { clientEmail, privateKey }
+    : null;
+}
+
+function googlePlayConfigured() {
+  if (GOOGLE_PLAY_LOCAL_TESTS_ALLOWED && /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(GOOGLE_PLAY_API_BASE_URL)) {
+    return true;
+  }
+  return !!googlePlayServiceAccount();
+}
+
+function googlePlayBase64Url(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+async function googlePlayAccessToken() {
+  if (GOOGLE_PLAY_LOCAL_TESTS_ALLOWED && /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(GOOGLE_PLAY_API_BASE_URL)) {
+    return 'local-test-token';
+  }
+  const now = Date.now();
+  if (googlePlayAccessTokenCache.token && googlePlayAccessTokenCache.expiresAt - 60000 > now) {
+    return googlePlayAccessTokenCache.token;
+  }
+  const account = googlePlayServiceAccount();
+  if (!account) {
+    throw Object.assign(new Error('Google Play service account yapılandırılmadı.'), { code: 'play_not_configured' });
+  }
+  const issuedAt = Math.floor(now / 1000);
+  const header = googlePlayBase64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const payload = googlePlayBase64Url(JSON.stringify({
+    iss: account.clientEmail,
+    scope: GOOGLE_PLAY_SCOPE,
+    aud: GOOGLE_PLAY_OAUTH_TOKEN_URL,
+    iat: issuedAt,
+    exp: issuedAt + 3600,
+  }));
+  const unsigned = `${header}.${payload}`;
+  const signature = crypto.sign('RSA-SHA256', Buffer.from(unsigned), account.privateKey).toString('base64url');
+  const assertion = `${unsigned}.${signature}`;
+  const response = await fetch(GOOGLE_PLAY_OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.access_token) {
+    throw Object.assign(new Error(`Google Play OAuth başarısız: ${body.error_description || body.error || response.status}`), {
+      code: 'play_oauth_failed',
+      statusCode: response.status,
+    });
+  }
+  googlePlayAccessTokenCache = {
+    token: String(body.access_token),
+    expiresAt: now + Math.max(300, Number(body.expires_in || 3600)) * 1000,
+  };
+  return googlePlayAccessTokenCache.token;
+}
+
+async function googlePlayApiRequest(method, apiPath, { query = null, body = null } = {}) {
+  if (!googlePlayConfigured()) {
+    throw Object.assign(new Error('Google Play satın alma doğrulaması yapılandırılmadı.'), { code: 'play_not_configured' });
+  }
+  const accessToken = await googlePlayAccessToken();
+  const url = new URL(`${GOOGLE_PLAY_API_BASE_URL}${apiPath}`);
+  if (query && typeof query === 'object') {
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null && String(value) !== '') url.searchParams.set(key, String(value));
+    }
+  }
+  const response = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(20000),
+  });
+  const text = await response.text();
+  let parsed = {};
+  if (text) {
+    try { parsed = JSON.parse(text); } catch (_) { parsed = { raw: text.slice(0, 500) }; }
+  }
+  if (!response.ok) {
+    const message = parsed?.error?.message || parsed?.message || `Google Play API HTTP ${response.status}`;
+    throw Object.assign(new Error(message), {
+      code: response.status === 404 ? 'play_purchase_not_found' : 'play_api_failed',
+      statusCode: response.status,
+      playError: parsed?.error || parsed,
+    });
+  }
+  return parsed;
+}
+
+function googlePlayPurchaseTokenHash(purchaseToken) {
+  return crypto.createHmac('sha256', WALLET_LEDGER_SECRET)
+    .update(`RELAXFPS:PLAY:PURCHASE:${String(purchaseToken || '')}`, 'utf8')
+    .digest('hex');
+}
+
+function googlePlayObfuscatedAccountId(id) {
+  return crypto.createHmac('sha256', WALLET_LEDGER_SECRET)
+    .update(`RELAXFPS:PLAY:ACCOUNT:${normalizeId(id)}`, 'utf8')
+    .digest('hex');
+}
+
+function googlePlayCatalogSnapshot(id = '') {
+  return {
+    configured: googlePlayConfigured(),
+    packageName: GOOGLE_PLAY_PACKAGE_NAME,
+    obfuscatedAccountId: validId(normalizeId(id)) ? googlePlayObfuscatedAccountId(id) : '',
+    products: Object.entries(GOOGLE_PLAY_TOKEN_PRODUCTS).map(([productId, item]) => ({
+      productId,
+      amount: item.amount,
+      label: item.label,
+      consumable: true,
+    })),
+  };
+}
+
+function googlePlayPurchasePublic(item) {
+  if (!item || typeof item !== 'object') return null;
+  return {
+    id: String(item.id || item.tokenHash || '').slice(0, 80),
+    productId: String(item.productId || ''),
+    amount: Math.max(0, Math.round(Number(item.amount || 0))),
+    status: String(item.status || ''),
+    orderId: String(item.orderId || ''),
+    purchasedAt: String(item.purchasedAt || ''),
+    verifiedAt: String(item.verifiedAt || ''),
+    consumedAt: String(item.consumedAt || ''),
+    reversedAt: String(item.reversedAt || ''),
+    reversedAmount: Math.max(0, Math.round(Number(item.reversedAmount || 0))),
+    unrecoveredAmount: Math.max(0, Math.round(Number(item.unrecoveredAmount || 0))),
+    regionCode: String(item.regionCode || ''),
+  };
+}
+
+function googlePlayPurchaseHistory(id, limit = 50) {
+  const clean = normalizeId(id);
+  const maxItems = Math.max(1, Math.min(Math.round(Number(limit || 50)), 200));
+  return Object.values(state.playPurchases || {})
+    .filter((item) => normalizeId(item?.userId) === clean)
+    .sort((a, b) => Date.parse(b?.verifiedAt || b?.purchasedAt || 0) - Date.parse(a?.verifiedAt || a?.purchasedAt || 0))
+    .slice(0, maxItems)
+    .map(googlePlayPurchasePublic)
+    .filter(Boolean);
+}
+
+function googlePlayTrimPurchases() {
+  state.playPurchases = state.playPurchases && typeof state.playPurchases === 'object' ? state.playPurchases : {};
+  const entries = Object.entries(state.playPurchases);
+  if (entries.length <= GOOGLE_PLAY_MAX_PURCHASE_RECORDS) return;
+  entries.sort((a, b) => Date.parse(a[1]?.verifiedAt || a[1]?.purchasedAt || 0) - Date.parse(b[1]?.verifiedAt || b[1]?.purchasedAt || 0));
+  const removeCount = entries.length - GOOGLE_PLAY_MAX_PURCHASE_RECORDS;
+  for (const [tokenHash, item] of entries.slice(0, removeCount)) {
+    if (item?.orderId) delete state.playPurchaseOrderIndex[item.orderId];
+    delete state.playPurchases[tokenHash];
+  }
+}
+
+async function googlePlayGetProductPurchase(productId, purchaseToken) {
+  const encodedPackage = encodeURIComponent(GOOGLE_PLAY_PACKAGE_NAME);
+  const encodedProduct = encodeURIComponent(productId);
+  const encodedToken = encodeURIComponent(purchaseToken);
+  return googlePlayApiRequest(
+    'GET',
+    `/androidpublisher/v3/applications/${encodedPackage}/purchases/products/${encodedProduct}/tokens/${encodedToken}`,
+  );
+}
+
+async function googlePlayConsumeProduct(productId, purchaseToken) {
+  const encodedPackage = encodeURIComponent(GOOGLE_PLAY_PACKAGE_NAME);
+  const encodedProduct = encodeURIComponent(productId);
+  const encodedToken = encodeURIComponent(purchaseToken);
+  await googlePlayApiRequest(
+    'POST',
+    `/androidpublisher/v3/applications/${encodedPackage}/purchases/products/${encodedProduct}/tokens/${encodedToken}:consume`,
+  );
+  return true;
+}
+
+async function googlePlayVerifyAndGrant({ id, productId, purchaseToken, clientOrderId = '' }) {
+  const clean = normalizeId(id);
+  const cleanProduct = String(productId || '').trim();
+  const token = String(purchaseToken || '').trim();
+  const product = GOOGLE_PLAY_TOKEN_PRODUCTS[cleanProduct];
+  if (!validId(clean) || !product) {
+    throw Object.assign(new Error('Geçersiz kullanıcı veya RFX ürünü.'), { code: 'invalid_play_product' });
+  }
+  if (token.length < 20 || token.length > 4096) {
+    throw Object.assign(new Error('Geçersiz Google Play purchase token.'), { code: 'invalid_purchase_token' });
+  }
+  const tokenHash = googlePlayPurchaseTokenHash(token);
+  if (googlePlayPurchaseLocks.has(tokenHash)) return googlePlayPurchaseLocks.get(tokenHash);
+
+  const task = (async () => {
+    state.playPurchases = state.playPurchases || {};
+    state.playPurchaseOrderIndex = state.playPurchaseOrderIndex || {};
+    let existing = state.playPurchases[tokenHash] || null;
+    if (existing) {
+      if (existing.userId !== clean || existing.productId !== cleanProduct) {
+        walletSecurityEvent('play_purchase_token_reuse', { id: clean, productId: cleanProduct, tokenHash }, 'high');
+        throw Object.assign(new Error('Bu satın alma başka bir cüzdana veya ürüne bağlı.'), { code: 'purchase_token_reused' });
+      }
+      if (existing.status === 'reversed') {
+        throw Object.assign(new Error('Bu satın alma Google Play tarafından iade veya iptal edildi.'), { code: 'purchase_reversed' });
+      }
+      if (existing.status === 'consumed') {
+        return { duplicate: true, consumed: true, record: existing, transaction: walletFindTransaction(clean, `play:${tokenHash}`) };
+      }
+      try {
+        const latest = await googlePlayGetProductPurchase(cleanProduct, token);
+        const latestPurchaseState = Math.round(Number(latest.purchaseState ?? -1));
+        const latestProductId = String(latest.productId || cleanProduct);
+        const latestAccountId = String(latest.obfuscatedExternalAccountId || '');
+        if (latestPurchaseState !== 0) {
+          throw Object.assign(new Error('Google Play satın alımı artık geçerli değil.'), { code: 'purchase_not_purchased' });
+        }
+        if (latestProductId !== cleanProduct || latestAccountId !== googlePlayObfuscatedAccountId(clean)) {
+          throw Object.assign(new Error('Google Play satın alma bağlamı değişti.'), { code: 'purchase_context_mismatch' });
+        }
+        if (Math.round(Number(latest.consumptionState || 0)) !== 1) {
+          await googlePlayConsumeProduct(cleanProduct, token);
+        }
+        existing.status = 'consumed';
+        existing.consumedAt = existing.consumedAt || new Date().toISOString();
+        existing.lastError = '';
+        await saveStateDurable();
+        return { duplicate: true, consumed: true, record: existing, transaction: walletFindTransaction(clean, `play:${tokenHash}`) };
+      } catch (error) {
+        existing.lastError = String(error.message || '').slice(0, 240);
+        existing.lastConsumeAttemptAt = new Date().toISOString();
+        await saveStateDurable();
+        return { duplicate: true, consumed: false, record: existing, transaction: walletFindTransaction(clean, `play:${tokenHash}`) };
+      }
+    }
+
+    const requestKey = `play:${tokenHash}`;
+    const recoveredTransaction = walletFindTransaction(clean, requestKey);
+    const verified = await googlePlayGetProductPurchase(cleanProduct, token);
+    const purchaseState = Math.round(Number(verified.purchaseState ?? -1));
+    const consumptionState = Math.round(Number(verified.consumptionState ?? 0));
+    const quantity = Math.max(1, Math.round(Number(verified.quantity || 1)));
+    const verifiedProduct = String(verified.productId || cleanProduct);
+    const expectedAccountId = googlePlayObfuscatedAccountId(clean);
+    const returnedAccountId = String(verified.obfuscatedExternalAccountId || '');
+
+    if (purchaseState === 2) {
+      throw Object.assign(new Error('Google Play ödemesi hâlâ beklemede.'), { code: 'purchase_pending' });
+    }
+    if (purchaseState !== 0) {
+      throw Object.assign(new Error('Google Play satın alımı iptal edilmiş veya geçersiz.'), { code: 'purchase_not_purchased' });
+    }
+    if (consumptionState === 1 && !recoveredTransaction) {
+      throw Object.assign(new Error('Bu satın alma daha önce tüketilmiş.'), { code: 'purchase_already_consumed' });
+    }
+    if (verifiedProduct !== cleanProduct || quantity !== 1) {
+      throw Object.assign(new Error('Google Play ürün bilgisi beklenen paketle eşleşmiyor.'), { code: 'purchase_product_mismatch' });
+    }
+    if (!returnedAccountId || returnedAccountId !== expectedAccountId) {
+      walletSecurityEvent('play_account_binding_mismatch', {
+        id: clean,
+        productId: cleanProduct,
+        missing: !returnedAccountId,
+      }, 'high');
+      throw Object.assign(new Error('Satın alma RelaxFPS cüzdan kimliğiyle eşleşmiyor.'), { code: 'purchase_account_mismatch' });
+    }
+
+    const orderId = String(verified.orderId || clientOrderId || '').slice(0, 160);
+    if (orderId && state.playPurchaseOrderIndex[orderId] && state.playPurchaseOrderIndex[orderId] !== tokenHash) {
+      walletSecurityEvent('play_order_reuse', { id: clean, productId: cleanProduct, orderId }, 'high');
+      throw Object.assign(new Error('Google Play sipariş kimliği daha önce kullanılmış.'), { code: 'purchase_order_reused' });
+    }
+
+    let transaction = recoveredTransaction;
+    if (!transaction) {
+      transaction = await walletCommitDelta({
+        id: clean,
+        delta: product.amount,
+        type: 'GOOGLE_PLAY_PURCHASE',
+        action: cleanProduct,
+        requestId: requestKey,
+        source: 'google_play_server',
+        metadata: {
+          productId: cleanProduct,
+          orderId,
+          purchaseTimeMillis: String(verified.purchaseTimeMillis || ''),
+          regionCode: String(verified.regionCode || ''),
+          purchaseType: verified.purchaseType,
+        },
+      });
+    }
+
+    existing = {
+      id: tokenHash,
+      tokenHash,
+      userId: clean,
+      productId: cleanProduct,
+      amount: product.amount,
+      status: consumptionState === 1 ? 'consumed' : 'credited_unconsumed',
+      orderId,
+      purchasedAt: verified.purchaseTimeMillis
+        ? new Date(Number(verified.purchaseTimeMillis)).toISOString()
+        : new Date().toISOString(),
+      verifiedAt: new Date().toISOString(),
+      consumedAt: consumptionState === 1 ? new Date().toISOString() : '',
+      reversedAt: '',
+      reversedAmount: 0,
+      unrecoveredAmount: 0,
+      regionCode: String(verified.regionCode || ''),
+      ledgerTransactionId: transaction.id,
+      lastError: '',
+    };
+    state.playPurchases[tokenHash] = existing;
+    if (orderId) state.playPurchaseOrderIndex[orderId] = tokenHash;
+    googlePlayTrimPurchases();
+    await saveStateDurable();
+
+    let consumed = consumptionState === 1;
+    try {
+      if (!consumed) await googlePlayConsumeProduct(cleanProduct, token);
+      consumed = true;
+      existing.status = 'consumed';
+      existing.consumedAt = new Date().toISOString();
+      existing.lastError = '';
+    } catch (error) {
+      existing.lastError = String(error.message || '').slice(0, 240);
+      existing.lastConsumeAttemptAt = new Date().toISOString();
+      walletSecurityEvent('play_consume_failed', { id: clean, productId: cleanProduct, tokenHash, code: error.code || 'error' }, 'warning');
+    }
+    await saveStateDurable();
+    walletSecurityEvent('play_purchase_verified', { id: clean, productId: cleanProduct, amount: product.amount, consumed }, 'info');
+    sendTo(clean, {
+      type: 'wallet_changed',
+      wallet: walletPublicSnapshot(clean),
+      reason: 'google_play_purchase',
+      transaction: {
+        id: transaction.id,
+        amount: transaction.amount,
+        action: transaction.action,
+        balanceAfter: transaction.balanceAfter,
+        createdAt: transaction.createdAt,
+      },
+      serverTime: new Date().toISOString(),
+    });
+    return { duplicate: false, consumed, record: existing, transaction };
+  })().finally(() => googlePlayPurchaseLocks.delete(tokenHash));
+
+  googlePlayPurchaseLocks.set(tokenHash, task);
+  return task;
+}
+
+async function googlePlayApplyVoidedPurchase(item) {
+  const purchaseToken = String(item?.purchaseToken || '').trim();
+  if (!purchaseToken) return false;
+  const tokenHash = googlePlayPurchaseTokenHash(purchaseToken);
+  const record = state.playPurchases?.[tokenHash];
+  if (!record || record.status === 'reversed') return false;
+  const wallet = walletRecord(record.userId);
+  if (!wallet) return false;
+  const amount = Math.max(0, Math.round(Number(record.amount || 0)));
+  const available = Math.max(0, Math.round(Number(wallet.balance || 0)));
+  const recoverable = Math.min(amount, available);
+  const voidedTimeMillis = Math.max(0, Math.round(Number(item.voidedTimeMillis || Date.now())));
+  const requestKey = `play-refund:${tokenHash}:${voidedTimeMillis}`;
+  let transaction = walletFindTransaction(record.userId, requestKey);
+  if (!transaction) {
+    transaction = await walletCommitDelta({
+      id: record.userId,
+      delta: -recoverable,
+      type: 'GOOGLE_PLAY_REFUND',
+      action: record.productId,
+      requestId: requestKey,
+      source: 'google_play_voided_purchases',
+      metadata: {
+        orderId: String(item.orderId || record.orderId || ''),
+        voidedReason: item.voidedReason,
+        voidedSource: item.voidedSource,
+        voidedTimeMillis,
+        originalAmount: amount,
+        unrecoveredAmount: amount - recoverable,
+      },
+    });
+  }
+  record.status = 'reversed';
+  record.reversedAt = new Date(voidedTimeMillis).toISOString();
+  record.reversedAmount = recoverable;
+  record.unrecoveredAmount = amount - recoverable;
+  record.refundLedgerTransactionId = transaction.id;
+  record.voidedReason = item.voidedReason;
+  record.voidedSource = item.voidedSource;
+  await saveStateDurable();
+  walletSecurityEvent('play_purchase_reversed', {
+    id: record.userId,
+    productId: record.productId,
+    amount,
+    recovered: recoverable,
+    unrecovered: amount - recoverable,
+  }, amount > recoverable ? 'high' : 'warning');
+  sendTo(record.userId, {
+    type: 'wallet_changed',
+    wallet: walletPublicSnapshot(record.userId),
+    reason: 'google_play_refund',
+    serverTime: new Date().toISOString(),
+  });
+  return true;
+}
+
+async function googlePlaySyncVoidedPurchases({ force = false } = {}) {
+  if (!googlePlayConfigured() || googlePlayVoidedSyncRunning) return { ok: false, skipped: true };
+  googlePlayVoidedSyncRunning = true;
+  try {
+    state.playPurchaseSync = state.playPurchaseSync || { lastVoidedSyncAt: '', startTimeMs: 0, lastError: '' };
+    const previousStart = Math.max(0, Number(state.playPurchaseSync.startTimeMs || 0));
+    const startTimeMs = force || !previousStart
+      ? Date.now() - 30 * 24 * 60 * 60 * 1000
+      : Math.max(0, previousStart - 5 * 60 * 1000);
+    let pageToken = '';
+    let reversed = 0;
+    let pages = 0;
+    do {
+      const encodedPackage = encodeURIComponent(GOOGLE_PLAY_PACKAGE_NAME);
+      const response = await googlePlayApiRequest(
+        'GET',
+        `/androidpublisher/v3/applications/${encodedPackage}/purchases/voidedpurchases`,
+        { query: { startTime: startTimeMs, maxResults: 1000, token: pageToken || undefined, type: 0 } },
+      );
+      for (const item of Array.isArray(response.voidedPurchases) ? response.voidedPurchases : []) {
+        if (await googlePlayApplyVoidedPurchase(item)) reversed += 1;
+      }
+      pageToken = String(response.tokenPagination?.nextPageToken || '');
+      pages += 1;
+    } while (pageToken && pages < 20);
+    state.playPurchaseSync.lastVoidedSyncAt = new Date().toISOString();
+    state.playPurchaseSync.startTimeMs = Date.now();
+    state.playPurchaseSync.lastError = '';
+    await saveStateDurable();
+    return { ok: true, reversed, pages };
+  } catch (error) {
+    state.playPurchaseSync = state.playPurchaseSync || {};
+    state.playPurchaseSync.lastError = String(error.message || '').slice(0, 300);
+    state.playPurchaseSync.lastVoidedSyncAt = new Date().toISOString();
+    writeLocalStateNow();
+    console.warn('[GOOGLE PLAY] Voided purchase sync failed:', error.message);
+    return { ok: false, code: error.code || 'voided_sync_failed', message: error.message };
+  } finally {
+    googlePlayVoidedSyncRunning = false;
+  }
 }
 
 
@@ -3216,6 +3736,103 @@ wss.on('connection', (socket, request) => {
         settings: walletSettingsSnapshot(),
         serverTime: new Date().toISOString(),
       });
+      return;
+    }
+
+    if (type === 'wallet_play_catalog') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_play_catalog');
+      if (!wallet) return;
+      const rate = walletRateLimit(`play-catalog:${socketIp}:${id}`, 30, 60 * 1000, 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'wallet_play_catalog', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla Google Play katalog isteği.' });
+        return;
+      }
+      send(socket, {
+        type: 'wallet_play_catalog',
+        ok: true,
+        requestId,
+        ...googlePlayCatalogSnapshot(id),
+        wallet: walletPublicSnapshot(id),
+        serverTime: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === 'wallet_play_history') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_play_history');
+      if (!wallet) return;
+      const rate = walletRateLimit(`play-history:${socketIp}:${id}`, 30, 60 * 1000, 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'wallet_play_history', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla satın alma geçmişi isteği.' });
+        return;
+      }
+      send(socket, {
+        type: 'wallet_play_history',
+        ok: true,
+        requestId,
+        items: googlePlayPurchaseHistory(id, data.limit),
+        wallet: walletPublicSnapshot(id),
+        serverTime: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === 'wallet_play_verify') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_play_verify');
+      if (!wallet) return;
+      const rate = walletRateLimit(`play-verify:${socketIp}:${id}`, 12, 10 * 60 * 1000, 30 * 60 * 1000);
+      if (!rate.ok) {
+        walletSecurityEvent('play_verify_rate_limited', { id, ip: socketIp }, 'warning');
+        send(socket, { type: 'wallet_play_verify', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla satın alma doğrulama isteği.' });
+        return;
+      }
+      try {
+        const result = await googlePlayVerifyAndGrant({
+          id,
+          productId: data.productId,
+          purchaseToken: data.purchaseToken,
+          clientOrderId: data.orderId,
+        });
+        send(socket, {
+          type: 'wallet_play_verify',
+          ok: true,
+          requestId,
+          duplicate: result.duplicate === true,
+          consumed: result.consumed === true,
+          amount: Math.max(0, Math.round(Number(result.record?.amount || 0))),
+          purchase: googlePlayPurchasePublic(result.record),
+          transaction: result.transaction ? {
+            id: result.transaction.id,
+            type: result.transaction.type,
+            amount: result.transaction.amount,
+            balanceAfter: result.transaction.balanceAfter,
+            action: result.transaction.action,
+            createdAt: result.transaction.createdAt,
+          } : null,
+          wallet: walletPublicSnapshot(id),
+          serverTime: new Date().toISOString(),
+        });
+      } catch (error) {
+        const code = String(error.code || 'play_verify_failed');
+        const severity = ['purchase_pending', 'play_not_configured'].includes(code) ? 'info' : 'high';
+        walletSecurityEvent('play_purchase_rejected', {
+          id,
+          productId: String(data.productId || ''),
+          code,
+          ip: socketIp,
+        }, severity);
+        send(socket, {
+          type: 'wallet_play_verify',
+          ok: false,
+          requestId,
+          code,
+          message: error.message,
+          wallet: walletPublicSnapshot(id),
+        });
+      }
       return;
     }
 
@@ -4813,11 +5430,24 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.3-rfx-token-c running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.4-rfx-token-d running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
     if (ADMIN_TOTP_SECRET) console.log('[SECURITY] Admin TOTP is enabled.');
+    if (googlePlayConfigured()) {
+      console.log(`[GOOGLE PLAY] Token D verification active for ${GOOGLE_PLAY_PACKAGE_NAME}.`);
+      const initialPlaySync = setTimeout(() => {
+        googlePlaySyncVoidedPurchases().catch((error) => console.warn('[GOOGLE PLAY] Initial voided sync failed:', error.message));
+      }, 15000);
+      initialPlaySync.unref?.();
+      const playSyncTimer = setInterval(() => {
+        googlePlaySyncVoidedPurchases().catch((error) => console.warn('[GOOGLE PLAY] Scheduled voided sync failed:', error.message));
+      }, GOOGLE_PLAY_VOIDED_SYNC_INTERVAL_MS);
+      playSyncTimer.unref?.();
+    } else {
+      console.warn('[GOOGLE PLAY] Token D is installed but service-account credentials are not configured.');
+    }
   });
 }
 
