@@ -115,161 +115,131 @@ Admin panelinin HTML/JavaScript dosyalarının kullanıcı tarafından görüleb
 
 ---
 
-# RFX Token A — Güvenli Sunucu Cüzdanı (v6.1)
+# Token A.1 — Ücretsiz Supabase Kalıcılığı
 
-Bu sürüm RFX Token ekonomisinin sunucu tarafındaki güvenli temelini ekler. Mobil uygulama, bakiyenin sahibi değildir; yalnızca sunucudaki cüzdanı görüntüler ve imzalı işlem isteği gönderir.
+Bu sürüm Render'ın geçici yerel dosya sistemine ek olarak sunucunun bütün durumunu Supabase'e imzalı ve sıkıştırılmış biçimde kaydeder.
 
-## Yeni zorunlu ortam değişkeni
+Kalıcı kopyaya şunlar dahildir:
 
-Render ortam değişkenlerine, dağıtımdan **önce** sabit ve en az 32 karakterlik bir değer ekle:
+- RFX Token cüzdanları ve işlem defteri
+- Premium ve promosyon kayıtları
+- Arkadaşlıklar, mesajlar ve gruplar
+- Duyurular ve Admin Studio ayarları
+- Çark, bulut yedekleri, benchmark ve topluluk kayıtları
+- Uygulama kontrol ayarları ve güvenlik kayıtları
 
-```text
-RELAXFPS_WALLET_LEDGER_SECRET=<çok uzun rastgele ve sabit gizli değer>
-```
+## 1. Supabase SQL kurulumu
 
-Örnek üretim komutu:
-
-```bash
-node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
-```
-
-Bu değeri daha sonra değiştirme. İşlem defteri HMAC zinciri bu anahtarla doğrulanır. Secret değişirse sunucu güvenlik amacıyla token ekleme/harcama işlemlerini durdurur. Secret hiçbir zaman Flutter koduna, APK'ya veya GitHub deposuna yazılmamalıdır.
-
-Sunucu geriye dönük uyumluluk için `RELAXFPS_ADMIN_SESSION_SECRET` değerinden geçici bir anahtar türetebilir; fakat `/health` yanıtında `wallet.securityConfigured` false görünür. Canlı kullanımda ayrı `RELAXFPS_WALLET_LEDGER_SECRET` mutlaka ayarlanmalıdır.
-
-## Sunucu tarafında tutulan veriler
+Supabase Dashboard içinden **SQL Editor** bölümünü aç ve paketteki şu dosyanın tamamını çalıştır:
 
 ```text
-wallets                 Kullanıcıların sunucu esaslı cüzdanları
-walletTransactions      HMAC zincirli, eklemeli işlem defteri
-walletRequestIndex      Aynı operationId'nin iki kez harcanmasını engeller
-walletSecurityEvents    Hatalı anahtar, hız sınırı ve tekrar saldırısı kayıtları
-walletSettings          Hoş geldin ödülü ve sunucu fiyat kataloğu
-walletLedgerHead        Son doğrulanmış işlem hash'i
-walletLedgerSequence    Küresel işlem sıra numarası
+supabase_kalici_veri.sql
 ```
 
-Cüzdan anahtarı, kurtarma anahtarı ve cihaz kimliği düz metin olarak tutulmaz. Sunucu anahtarlı HMAC özeti saklanır.
+İşlem sonunda `relaxfps_server_state` tablosu ile `relaxfps_save_server_state(...)` fonksiyonu görünür.
 
-## Varsayılan ekonomi
+Tabloda RLS zorunludur. `anon` ve `authenticated` rolleri hiçbir erişim almaz. Yalnızca sunucu tarafındaki `service_role` erişebilir.
 
-- İlk güvenli cüzdan oluşturma: `+500 RFX Token`
-- Premium kullanıcı: token harcamaz, işlem geçmişine `PREMIUM_BYPASS` kaydı düşer
-- Normal optimizasyon: `30`
-- Gelişmiş optimizasyon: `50`
-- Basit testler: `5–15`
-- Ağ testi: `20`
-- Ağır termal/gecikme araçları: `75`
-- Sunucu 10 dakika: `50`
-- Sunucu 30 dakika: `100`
-- Sunucu 2 saat: `250`
-- Sunucu 24 saat: `500`
+## 2. Render ortam değişkenleri
 
-Fiyatların tamamı Admin Studio içindeki **RFX Token** bölümünden değiştirilebilir. Mobil uygulamanın gönderdiği fiyat kabul edilmez; gerçek fiyat her zaman sunucunun kataloğundan okunur.
+Render > RELAXFPS servisi > Environment bölümüne ekle:
 
-## WebSocket cüzdan mesajları
+```text
+SUPABASE_URL=https://PROJE_KODUN.supabase.co
+SUPABASE_SECRET_KEY=sb_secret_...
+RELAXFPS_SUPABASE_SYNC=true
+```
 
-### `wallet_catalog`
+Yeni `sb_secret_...` anahtarın yoksa geçici olarak legacy sunucu anahtarı kullanılabilir:
 
-Kimlik doğrulama gerektirmeden güncel fiyat kataloğunu döndürür.
+```text
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
+```
 
-### `wallet_enroll`
+`SUPABASE_SECRET_KEY` ile `SUPABASE_SERVICE_ROLE_KEY` değişkenlerinden yalnızca birini eklemek yeterlidir. Yeni secret key tercih edilir.
 
-Önce aynı RelaxFPS ID ile `register` yapılmalıdır. Ayrıca aynı kurtarma anahtarıyla bulut yedeği etkin olmalıdır.
+Bu anahtarı:
+
+- Flutter uygulamasına koyma.
+- GitHub'a yükleme.
+- Ekran görüntüsünde paylaşma.
+- Publishable/anon anahtarla karıştırma.
+
+Publishable veya anon anahtar bu sunucu kalıcılığı için yeterli değildir.
+
+Mevcut şu değişken aynı kalmalıdır:
+
+```text
+RELAXFPS_WALLET_LEDGER_SECRET=<daha önce oluşturduğun sabit gizli değer>
+```
+
+`DATA_FILE` eklemek zorunda değilsin. Yerel JSON yalnızca geçici güvenlik kopyası olarak tutulur; asıl kalıcı kopya Supabase'dir.
+
+## 3. Dağıtım sonrası kontrol
+
+Sunucu `Live` olduktan sonra:
+
+```text
+https://relaxfps-friends-server.onrender.com/health
+```
+
+Beklenen bölüm:
 
 ```json
-{
-  "type": "wallet_enroll",
-  "walletKey": "istemcide-üretilen-en-az-32-karakter-anahtar",
-  "recoveryKey": "KULLANICININ-KURTARMA-ANAHTARI",
-  "deviceId": "uygulamanın-yerel-cihaz-kimliği",
-  "requestId": "benzersiz-istek"
+"persistence": {
+  "mode": "supabase",
+  "configured": true,
+  "connected": true,
+  "loadedFromCloud": true,
+  "revision": 1,
+  "dirty": false,
+  "conflict": false,
+  "lastError": ""
 }
 ```
 
-İlk başarılı kayıtta 500 token yalnızca bir kez verilir. Uygulamayı silip tekrar kurmak yeni ödül oluşturmaz.
-
-### `wallet_status`
-
-```json
-{
-  "type": "wallet_status",
-  "walletKey": "...",
-  "requestId": "..."
-}
-```
-
-### `wallet_spend`
-
-```json
-{
-  "type": "wallet_spend",
-  "walletKey": "...",
-  "operationId": "her-işlem-icin-benzersiz-en-az-12-karakter",
-  "action": "network_stability",
-  "metadata": { "tool": "network" },
-  "requestId": "arayüz-istek-kodu"
-}
-```
-
-- `operationId` aynı kullanıcı için tekrar gönderilirse token ikinci kez düşmez.
-- Aynı `operationId` farklı `action` ile kullanılırsa güvenlik olayı oluşturulur.
-- Kullanıcının gönderdiği miktar yok sayılır; fiyat sunucudan gelir.
-- Yetersiz bakiye sunucu tarafından reddedilir.
-- Premium kullanıcı için bakiye düşmez.
-
-### `wallet_history`
-
-Son 1–200 işlemi sayfalı şekilde döndürür.
-
-### `wallet_recover`
-
-Yeni cihazda kurtarma anahtarı doğrulanır ve eski cüzdan anahtarı geçersiz hâle getirilerek yeni anahtar bağlanır.
-
-## Admin Studio
-
-Sol menüye **RFX Token** sayfası eklenmiştir:
-
-- Toplam cüzdan ve dolaşımdaki token
-- İşlem defteri bütünlük durumu
-- Kullanıcı bakiyesi ekleme/çıkarma
-- Cüzdanı geçici veya süresiz kilitleme
-- Hoş geldin ödülü ve işlem fiyatlarını değiştirme
-- Son token işlemleri
-- Şüpheli güvenlik olayları
-- HMAC işlem defterini elle doğrulama
-
-Admin işlemleri de işlem defterine yazılır ve audit log'a eklenir.
+İlk çalıştırmada Supabase satırı henüz yoksa sunucu mevcut yerel veriyi otomatik olarak `revision: 1` ile yükler. Sonraki açılışlarda önce Supabase kopyası doğrulanır ve geri yüklenir.
 
 ## Güvenlik davranışı
 
-- 8 hatalı cüzdan anahtarı denemesi aynı IP/ID için 15 dakikalık geçici doğrulama engeli oluşturur.
-- Harcama uç noktası dakikada sınırlıdır.
-- Aynı işlem isteği idempotenttir.
-- Cüzdan bakiyesi yalnızca sunucuda değişir.
-- İşlem defteri sunucu yeniden başladığında baştan doğrulanır.
-- Defter hash'i veya ledger secret uyuşmazsa token mutasyonları kapanır.
-- Tek bir istemci sinyalinde otomatik kalıcı ban uygulanmaz; güvenlik olayı Admin Studio'ya düşer.
-- Veri dosyası geçici dosyaya yazılıp atomik olarak değiştirilir; yarım JSON yazımı riski azaltılır.
+- Veriler gzip ile sıkıştırılır.
+- Kalıcı kopya, `RELAXFPS_WALLET_LEDGER_SECRET` üzerinden türetilen HMAC anahtarıyla imzalanır.
+- İmza eşleşmezse bulut kopyası kullanılmaz.
+- Her kayıt bir `revision` numarası taşır.
+- Eski bir Render örneği daha yeni veriyi ezmeye çalışırsa veritabanı işlemi reddeder.
+- Revision çakışmasında token işlemleri güvenlik amacıyla durdurulur.
+- Token harcama, cüzdan oluşturma ve cüzdan kurtarma cevapları ancak Supabase kaydı başarılı olduktan sonra kullanıcıya başarılı döner.
 
-## Yeni cihaz ve yedek
+## Admin Studio
 
-Token bakiyesi bulut yedeği JSON'una konmaz. Yeni cihazda:
+Genel bakış ekranında şu bilgiler görünür:
 
-1. Kullanıcı RelaxFPS ID ile bağlanır.
-2. Kurtarma anahtarını girer.
-3. Uygulama yeni yüksek entropili `walletKey` üretir.
-4. `wallet_recover` eski anahtarı iptal eder.
-5. Bakiye ve işlem geçmişi sunucudan gelir.
+- Supabase bağlantısı
+- Bulut revision numarası
+- Son kayıt zamanı
+- Bekleyen değişiklik
+- Sürüm çakışması
+- Son Supabase hatası
 
-## Bu aşamada henüz eklenmeyenler
+## İsteğe bağlı gelişmiş değişkenler
 
-Aşağıdaki özellikler sonraki aşamalarda bağlanacaktır:
+Normal kullanımda bunları ekleme:
 
-- Flutter üst bar token göstergesi ve Token Merkezi
-- Araç/optimizasyon ücretlerinin uygulama akışına bağlanması
-- AdMob Server-Side Verification ile reklam ödülü
-- Google Play token paketleri ve backend purchase doğrulaması
-- Play Integrity risk sinyalleri
+```text
+RELAXFPS_SUPABASE_STATE_ID=primary
+RELAXFPS_SUPABASE_TIMEOUT_MS=15000
+RELAXFPS_SUPABASE_SAVE_DEBOUNCE_MS=1200
+RELAXFPS_SUPABASE_MAX_COMPRESSED_BYTES=12582912
+```
 
-Token A yalnızca güvenli cüzdan, fiyat kataloğu, işlem defteri, yönetici araçları ve yeni cihaz kurtarma omurgasını oluşturur.
+`RELAXFPS_SUPABASE_STATE_ID` değerini daha sonra değiştirmek yeni ve boş bir sunucu durumu oluşturur. Bu nedenle varsayılan `primary` değerini koru.
+
+## Acil durumda Supabase'i kapatma
+
+Yalnızca test veya sorun tespiti için:
+
+```text
+RELAXFPS_SUPABASE_SYNC=false
+```
+
+Bu durumda sunucu yerel geçici moda geçer. Gerçek token sistemi için bu mod kullanılmamalıdır.

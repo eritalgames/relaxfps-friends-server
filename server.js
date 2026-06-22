@@ -3,6 +3,7 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const PORT = process.env.PORT || 8080;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'relaxfps-friends-data.json');
@@ -31,6 +32,43 @@ const WALLET_MAX_TRANSACTIONS = 50000;
 const WALLET_MAX_SECURITY_EVENTS = 5000;
 const WALLET_MAX_REQUEST_INDEX = 30000;
 const WALLET_MAX_BALANCE = 1000000000;
+
+
+// Free persistent storage through Supabase. Keep the secret/service-role key
+// only in Render environment variables; never ship it in Flutter or GitHub.
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/g, '');
+const SUPABASE_SERVER_KEY = String(
+  process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+);
+const SUPABASE_STATE_ID = String(process.env.RELAXFPS_SUPABASE_STATE_ID || 'primary')
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9_-]/g, '')
+  .slice(0, 64) || 'primary';
+const SUPABASE_SYNC_ENABLED = String(process.env.RELAXFPS_SUPABASE_SYNC || 'true').toLowerCase() !== 'false';
+const SUPABASE_ALLOW_INSECURE_LOCAL = String(process.env.RELAXFPS_SUPABASE_ALLOW_INSECURE_LOCAL || 'false').toLowerCase() === 'true';
+const SUPABASE_URL_VALID = /^https:\/\/[a-z0-9.-]+\.supabase\.co$/i.test(SUPABASE_URL)
+  || (SUPABASE_ALLOW_INSECURE_LOCAL && /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(SUPABASE_URL));
+const SUPABASE_CONFIGURED = SUPABASE_SYNC_ENABLED
+  && SUPABASE_URL_VALID
+  && SUPABASE_SERVER_KEY.length >= 20;
+const SUPABASE_REQUEST_TIMEOUT_MS = Math.max(
+  3000,
+  Math.min(Number(process.env.RELAXFPS_SUPABASE_TIMEOUT_MS || 15000), 60000),
+);
+const SUPABASE_SAVE_DEBOUNCE_MS = Math.max(
+  250,
+  Math.min(Number(process.env.RELAXFPS_SUPABASE_SAVE_DEBOUNCE_MS || 1200), 10000),
+);
+const SUPABASE_MAX_COMPRESSED_BYTES = Math.max(
+  1024 * 1024,
+  Math.min(Number(process.env.RELAXFPS_SUPABASE_MAX_COMPRESSED_BYTES || 12 * 1024 * 1024), 48 * 1024 * 1024),
+);
+const SUPABASE_INSTANCE_ID = `${process.env.RENDER_INSTANCE_ID || process.env.RENDER_SERVICE_ID || 'local'}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+const SUPABASE_PAYLOAD_ENCODING = 'gzip-base64-json-v1';
+const SUPABASE_STATE_SIGNING_KEY = crypto.createHmac('sha256', WALLET_LEDGER_SECRET)
+  .update(`RELAXFPS:SUPABASE:STATE:${SUPABASE_STATE_ID}`, 'utf8')
+  .digest();
 
 const adminSessions = new Map(); // token -> {createdAt, expiresAt, lastUsedAt, ip, userAgent}
 const adminLoginAttempts = new Map(); // ip -> {count, blockedUntil, lastAttemptAt}
@@ -193,58 +231,91 @@ const state = {
   walletLedgerKeyId: '',
 };
 
+function applyLoadedState(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('State payload is not a JSON object');
+  }
+  Object.assign(state, parsed);
+  state.profiles = state.profiles && typeof state.profiles === 'object' ? state.profiles : {};
+  state.friendships = state.friendships && typeof state.friendships === 'object' ? state.friendships : {};
+  state.friendRequests = Array.isArray(state.friendRequests) ? state.friendRequests : [];
+  state.messages = state.messages && typeof state.messages === 'object' ? state.messages : {};
+  state.announcements = Array.isArray(state.announcements) ? state.announcements : [];
+  state.customPanels = Array.isArray(state.customPanels) ? state.customPanels : [];
+  state.feedback = Array.isArray(state.feedback) ? state.feedback : [];
+  state.developerMessages = Array.isArray(state.developerMessages) ? state.developerMessages : [];
+  state.premiumUsers = state.premiumUsers || {};
+  state.bannedUsers = state.bannedUsers || {};
+  state.appSettings = normalizeAppSettings(state.appSettings);
+  if (Number(state.appSettings.appLockLockMinutes || 0) === 10) state.appSettings.appLockLockMinutes = 2;
+  state.crashReports = Array.isArray(state.crashReports) ? state.crashReports : [];
+  state.clientEvents = Array.isArray(state.clientEvents) ? state.clientEvents : [];
+  state.testUsers = state.testUsers || {};
+  state.userNotes = state.userNotes || {};
+  state.backups = Array.isArray(state.backups) ? state.backups : [];
+  state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
+  state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
+  state.benchmarkScores = state.benchmarkScores || {};
+  state.promoCodes = state.promoCodes || {};
+  state.groups = state.groups || {};
+  state.groupInvites = Array.isArray(state.groupInvites) ? state.groupInvites : [];
+  state.groupMessages = state.groupMessages || {};
+  state.friendUsage = state.friendUsage || {};
+  state.dailyWheel = state.dailyWheel || {};
+  state.premiumDiscounts = state.premiumDiscounts || {};
+  state.flashOffers = state.flashOffers || {};
+  state.cloudBackups = state.cloudBackups || {};
+  state.communitySignals = state.communitySignals || {};
+  state.wallets = state.wallets && typeof state.wallets === 'object' ? state.wallets : {};
+  state.walletTransactions = Array.isArray(state.walletTransactions) ? state.walletTransactions : [];
+  state.walletRequestIndex = state.walletRequestIndex && typeof state.walletRequestIndex === 'object' ? state.walletRequestIndex : {};
+  state.walletSecurityEvents = Array.isArray(state.walletSecurityEvents) ? state.walletSecurityEvents : [];
+  state.walletSettings = normalizeWalletSettings(state.walletSettings);
+  state.walletLedgerHead = String(state.walletLedgerHead || '');
+  state.walletLedgerSequence = Math.max(0, Math.round(Number(state.walletLedgerSequence || 0)));
+  state.walletLedgerAnchor = state.walletLedgerAnchor && typeof state.walletLedgerAnchor === 'object'
+    ? state.walletLedgerAnchor
+    : { sequence: 0, hash: 'GENESIS' };
+  state.walletLedgerKeyId = String(state.walletLedgerKeyId || '');
+}
+
 function loadState() {
   try {
     if (fs.existsSync(DATA_FILE)) {
-      const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      Object.assign(state, parsed);
-      state.announcements = Array.isArray(state.announcements) ? state.announcements : [];
-      state.customPanels = Array.isArray(state.customPanels) ? state.customPanels : [];
-      state.feedback = Array.isArray(state.feedback) ? state.feedback : [];
-      state.developerMessages = Array.isArray(state.developerMessages) ? state.developerMessages : [];
-      state.premiumUsers = state.premiumUsers || {};
-      state.bannedUsers = state.bannedUsers || {};
-      state.appSettings = normalizeAppSettings(state.appSettings);
-      if (Number(state.appSettings.appLockLockMinutes || 0) === 10) state.appSettings.appLockLockMinutes = 2;
-      state.crashReports = Array.isArray(state.crashReports) ? state.crashReports : [];
-      state.clientEvents = Array.isArray(state.clientEvents) ? state.clientEvents : [];
-      state.testUsers = state.testUsers || {};
-      state.userNotes = state.userNotes || {};
-      state.backups = Array.isArray(state.backups) ? state.backups : [];
-      state.adminAuditLog = Array.isArray(state.adminAuditLog) ? state.adminAuditLog : [];
-      state.adminSecurity = state.adminSecurity || { wrongPasswordCount: 0, lastWrongPasswordAt: null, sessionMinutes: 60 };
-      state.benchmarkScores = state.benchmarkScores || {};
-      state.promoCodes = state.promoCodes || {};
-      state.groups = state.groups || {};
-      state.groupInvites = Array.isArray(state.groupInvites) ? state.groupInvites : [];
-      state.groupMessages = state.groupMessages || {};
-      state.friendUsage = state.friendUsage || {};
-      state.dailyWheel = state.dailyWheel || {};
-      state.premiumDiscounts = state.premiumDiscounts || {};
-      state.flashOffers = state.flashOffers || {};
-      state.cloudBackups = state.cloudBackups || {};
-      state.communitySignals = state.communitySignals || {};
-      state.wallets = state.wallets && typeof state.wallets === 'object' ? state.wallets : {};
-      state.walletTransactions = Array.isArray(state.walletTransactions) ? state.walletTransactions : [];
-      state.walletRequestIndex = state.walletRequestIndex && typeof state.walletRequestIndex === 'object' ? state.walletRequestIndex : {};
-      state.walletSecurityEvents = Array.isArray(state.walletSecurityEvents) ? state.walletSecurityEvents : [];
-      state.walletSettings = normalizeWalletSettings(state.walletSettings);
-      state.walletLedgerHead = String(state.walletLedgerHead || '');
-      state.walletLedgerSequence = Math.max(0, Math.round(Number(state.walletLedgerSequence || 0)));
-      state.walletLedgerAnchor = state.walletLedgerAnchor && typeof state.walletLedgerAnchor === 'object'
-        ? state.walletLedgerAnchor
-        : { sequence: 0, hash: 'GENESIS' };
-      state.walletLedgerKeyId = String(state.walletLedgerKeyId || '');
+      applyLoadedState(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
+      return true;
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
   }
+  return false;
 }
 
 let saveTimer = null;
+let supabaseSaveTimer = null;
+let supabaseSaveChain = Promise.resolve();
+let supabaseStateRevision = 0;
+let supabaseDirty = false;
+let walletMutationChain = Promise.resolve();
+let supabaseStatus = {
+  configured: SUPABASE_CONFIGURED,
+  enabled: SUPABASE_SYNC_ENABLED,
+  connected: false,
+  loadedFromCloud: false,
+  cloudRowExists: false,
+  revision: 0,
+  dirty: false,
+  conflict: false,
+  lastLoadAt: '',
+  lastSaveAt: '',
+  lastErrorAt: '',
+  lastError: '',
+};
+
 function saveStateSoon() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveStateNow, 300);
+  saveTimer.unref?.();
 }
 
 function adminAudit(action, detail = {}) {
@@ -254,7 +325,7 @@ function adminAudit(action, detail = {}) {
   saveStateSoon();
 }
 
-function saveStateNow() {
+function writeLocalStateNow() {
   const tempFile = `${DATA_FILE}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
@@ -268,6 +339,235 @@ function saveStateNow() {
     console.warn('[STATE] Could not save data file:', error.message);
     return false;
   }
+}
+
+function supabaseHeaders() {
+  return {
+    apikey: SUPABASE_SERVER_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVER_KEY}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+}
+
+async function supabaseRequest(pathname, options = {}) {
+  if (!SUPABASE_CONFIGURED) throw Object.assign(new Error('Supabase persistence is not configured.'), { code: 'supabase_not_configured' });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SUPABASE_REQUEST_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await fetch(`${SUPABASE_URL}${pathname}`, {
+      ...options,
+      headers: { ...supabaseHeaders(), ...(options.headers || {}) },
+      signal: controller.signal,
+    });
+    const bodyText = await response.text();
+    let body = null;
+    if (bodyText) {
+      try { body = JSON.parse(bodyText); } catch (_) { body = bodyText; }
+    }
+    if (!response.ok) {
+      const message = typeof body === 'object' && body
+        ? String(body.message || body.details || body.hint || response.statusText)
+        : String(body || response.statusText);
+      throw Object.assign(new Error(`Supabase ${response.status}: ${message}`), {
+        code: 'supabase_http_error',
+        statusCode: response.status,
+        responseBody: body,
+      });
+    }
+    return body;
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw Object.assign(new Error('Supabase request timed out.'), { code: 'supabase_timeout' });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function encodeSupabaseState() {
+  const json = Buffer.from(JSON.stringify(state), 'utf8');
+  const compressed = zlib.gzipSync(json, { level: 6 });
+  if (compressed.length > SUPABASE_MAX_COMPRESSED_BYTES) {
+    throw Object.assign(
+      new Error(`Compressed state is too large (${compressed.length} bytes).`),
+      { code: 'supabase_payload_too_large', compressedBytes: compressed.length },
+    );
+  }
+  const payload = compressed.toString('base64');
+  const checksum = crypto.createHmac('sha256', SUPABASE_STATE_SIGNING_KEY)
+    .update(`${SUPABASE_PAYLOAD_ENCODING}\n${payload}`, 'utf8')
+    .digest('hex');
+  return {
+    payload,
+    checksum,
+    encoding: SUPABASE_PAYLOAD_ENCODING,
+    jsonBytes: json.length,
+    compressedBytes: compressed.length,
+  };
+}
+
+function decodeSupabaseState(row) {
+  const encoding = String(row?.payload_encoding || '');
+  const payload = String(row?.payload || '');
+  const checksum = String(row?.checksum || '');
+  if (encoding !== SUPABASE_PAYLOAD_ENCODING || !payload || !checksum) {
+    throw Object.assign(new Error('Supabase state row has an unsupported format.'), { code: 'supabase_bad_payload' });
+  }
+  const expected = crypto.createHmac('sha256', SUPABASE_STATE_SIGNING_KEY)
+    .update(`${encoding}\n${payload}`, 'utf8')
+    .digest('hex');
+  if (!secureStringEqual(checksum, expected)) {
+    throw Object.assign(new Error('Supabase state checksum validation failed.'), { code: 'supabase_checksum_failed' });
+  }
+  const compressed = Buffer.from(payload, 'base64');
+  if (!compressed.length || compressed.length > SUPABASE_MAX_COMPRESSED_BYTES) {
+    throw Object.assign(new Error('Supabase state payload size is invalid.'), { code: 'supabase_bad_payload_size' });
+  }
+  const json = zlib.gunzipSync(compressed).toString('utf8');
+  return JSON.parse(json);
+}
+
+function markSupabaseError(error) {
+  supabaseStatus.connected = false;
+  supabaseStatus.lastErrorAt = new Date().toISOString();
+  supabaseStatus.lastError = String(error?.message || error || 'Unknown Supabase error').slice(0, 500);
+  console.warn('[SUPABASE]', supabaseStatus.lastError);
+}
+
+async function loadStateFromSupabase() {
+  if (!SUPABASE_CONFIGURED) return false;
+  try {
+    const rows = await supabaseRequest(
+      `/rest/v1/relaxfps_server_state?state_id=eq.${encodeURIComponent(SUPABASE_STATE_ID)}&select=state_id,revision,payload,payload_encoding,checksum,updated_at&limit=1`,
+      { method: 'GET' },
+    );
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row) {
+      supabaseStateRevision = 0;
+      supabaseStatus.connected = true;
+      supabaseStatus.cloudRowExists = false;
+      supabaseStatus.loadedFromCloud = false;
+      supabaseStatus.revision = 0;
+      supabaseStatus.lastLoadAt = new Date().toISOString();
+      return false;
+    }
+    const parsed = decodeSupabaseState(row);
+    applyLoadedState(parsed);
+    supabaseStateRevision = Math.max(0, Math.round(Number(row.revision || 0)));
+    supabaseStatus.connected = true;
+    supabaseStatus.cloudRowExists = true;
+    supabaseStatus.loadedFromCloud = true;
+    supabaseStatus.revision = supabaseStateRevision;
+    supabaseStatus.conflict = false;
+    supabaseStatus.lastLoadAt = new Date().toISOString();
+    supabaseStatus.lastError = '';
+    writeLocalStateNow();
+    console.log(`[SUPABASE] Restored persistent server state at revision ${supabaseStateRevision}.`);
+    return true;
+  } catch (error) {
+    markSupabaseError(error);
+    return false;
+  }
+}
+
+async function saveStateToSupabaseNow({ required = false } = {}) {
+  if (!SUPABASE_CONFIGURED) return !required;
+  const encoded = encodeSupabaseState();
+  const expectedRevision = supabaseStateRevision;
+  const result = await supabaseRequest('/rest/v1/rpc/relaxfps_save_server_state', {
+    method: 'POST',
+    body: JSON.stringify({
+      p_state_id: SUPABASE_STATE_ID,
+      p_expected_revision: expectedRevision,
+      p_payload: encoded.payload,
+      p_payload_encoding: encoded.encoding,
+      p_checksum: encoded.checksum,
+      p_source_instance: SUPABASE_INSTANCE_ID,
+      p_payload_bytes: encoded.compressedBytes,
+    }),
+  });
+  const row = Array.isArray(result) ? result[0] : result;
+  if (!row || row.ok !== true) {
+    if (row?.conflict === true) {
+      supabaseStatus.conflict = true;
+      const error = Object.assign(
+        new Error(`Supabase revision conflict. Local=${expectedRevision}, cloud=${row.revision ?? '?'}`),
+        { code: 'supabase_revision_conflict', cloudRevision: row.revision },
+      );
+      markSupabaseError(error);
+      throw error;
+    }
+    throw Object.assign(new Error('Supabase state save was rejected.'), { code: 'supabase_save_rejected' });
+  }
+  supabaseStateRevision = Math.max(0, Math.round(Number(row.revision || expectedRevision + 1)));
+  supabaseStatus.connected = true;
+  supabaseStatus.cloudRowExists = true;
+  supabaseStatus.loadedFromCloud = true;
+  supabaseStatus.revision = supabaseStateRevision;
+  supabaseStatus.dirty = false;
+  supabaseStatus.conflict = false;
+  supabaseStatus.lastSaveAt = new Date().toISOString();
+  supabaseStatus.lastError = '';
+  return true;
+}
+
+function queueSupabaseSave(delayMs = SUPABASE_SAVE_DEBOUNCE_MS) {
+  if (!SUPABASE_CONFIGURED) return;
+  supabaseDirty = true;
+  supabaseStatus.dirty = true;
+  clearTimeout(supabaseSaveTimer);
+  supabaseSaveTimer = setTimeout(() => {
+    supabaseSaveTimer = null;
+    flushSupabaseState().catch(() => {});
+  }, delayMs);
+  supabaseSaveTimer.unref?.();
+}
+
+function flushSupabaseState({ required = false } = {}) {
+  if (!SUPABASE_CONFIGURED) return Promise.resolve(!required);
+  clearTimeout(supabaseSaveTimer);
+  supabaseSaveTimer = null;
+  supabaseDirty = false;
+  supabaseSaveChain = supabaseSaveChain.then(
+    async () => {
+      try {
+        return await saveStateToSupabaseNow({ required });
+      } catch (error) {
+        markSupabaseError(error);
+        if (!required) {
+          supabaseDirty = true;
+          supabaseStatus.dirty = true;
+          queueSupabaseSave(Math.min(SUPABASE_SAVE_DEBOUNCE_MS * 4, 10000));
+          return false;
+        }
+        throw error;
+      }
+    },
+    async () => saveStateToSupabaseNow({ required }),
+  );
+  return supabaseSaveChain;
+}
+
+function saveStateNow() {
+  const localSaved = writeLocalStateNow();
+  if (localSaved) queueSupabaseSave();
+  return localSaved;
+}
+
+async function saveStateDurable() {
+  if (!writeLocalStateNow()) return false;
+  if (!SUPABASE_CONFIGURED) return true;
+  await flushSupabaseState({ required: true });
+  return true;
+}
+
+function withWalletMutation(task) {
+  const run = walletMutationChain.then(task, task);
+  walletMutationChain = run.catch(() => {});
+  return run;
 }
 
 
@@ -461,7 +761,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.1.0-rfx-wallet',
+      version: '6.2.0-rfx-supabase',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -470,6 +770,17 @@ async function handleHttpRequest(req, res) {
         transactions: (state.walletTransactions || []).length,
         integrity: walletIntegrityStatus.ok,
         securityConfigured: WALLET_SECURITY_CONFIGURED,
+      },
+      persistence: {
+        mode: SUPABASE_CONFIGURED ? 'supabase' : 'local-ephemeral',
+        configured: SUPABASE_CONFIGURED,
+        connected: supabaseStatus.connected,
+        loadedFromCloud: supabaseStatus.loadedFromCloud,
+        revision: supabaseStatus.revision,
+        dirty: supabaseStatus.dirty,
+        conflict: supabaseStatus.conflict,
+        lastSaveAt: supabaseStatus.lastSaveAt,
+        lastError: supabaseStatus.lastError,
       },
       time: new Date().toISOString(),
     });
@@ -1273,11 +1584,17 @@ function walletTrimLedgerIfNeeded() {
   rebuildWalletRequestIndex();
 }
 
-function walletCommitDelta({ id, delta, type, action, requestId, source, metadata = {} }) {
+async function walletCommitDeltaUnlocked({ id, delta, type, action, requestId, source, metadata = {} }) {
   const clean = normalizeId(id);
   const wallet = walletRecord(clean);
   if (!wallet) throw Object.assign(new Error('RFX Token cüzdanı bulunamadı.'), { code: 'wallet_not_enrolled' });
   if (!walletIntegrityStatus.ok) throw Object.assign(new Error('Token işlem defteri güvenlik kontrolünden geçemedi.'), { code: 'ledger_unavailable' });
+  if (SUPABASE_SYNC_ENABLED && !SUPABASE_CONFIGURED) {
+    throw Object.assign(new Error('Kalıcı Supabase cüzdan bağlantısı yapılandırılmadı.'), { code: 'persistent_storage_required' });
+  }
+  if (supabaseStatus.conflict) {
+    throw Object.assign(new Error('Bulut veri sürümü çakıştı; token işlemleri güvenlik için durduruldu.'), { code: 'supabase_revision_conflict' });
+  }
   const settings = normalizeWalletSettings(state.walletSettings);
   if (!settings.enabled) throw Object.assign(new Error('RFX Token sistemi geçici olarak kapalı.'), { code: 'wallet_disabled' });
   const lock = walletIsLocked(wallet);
@@ -1332,7 +1649,9 @@ function walletCommitDelta({ id, delta, type, action, requestId, source, metadat
   if (requestId) state.walletRequestIndex[`${clean}:${requestId}`] = transaction.id;
   walletTrimLedgerIfNeeded();
 
-  if (!saveStateNow()) {
+  try {
+    if (!await saveStateDurable()) throw new Error('Local state could not be saved.');
+  } catch (error) {
     wallet.balance = previousState.balance;
     wallet.updatedAt = previousState.updatedAt;
     wallet.lastTransactionId = previousState.lastTransactionId;
@@ -1345,109 +1664,135 @@ function walletCommitDelta({ id, delta, type, action, requestId, source, metadat
       if (previousState.requestIndexValue) state.walletRequestIndex[key] = previousState.requestIndexValue;
       else delete state.walletRequestIndex[key];
     }
-    throw Object.assign(new Error('Token işlemi güvenli şekilde kaydedilemedi.'), { code: 'wallet_persistence_failed' });
+    writeLocalStateNow();
+    throw Object.assign(new Error('Token işlemi kalıcı veritabanına güvenli şekilde kaydedilemedi.'), {
+      code: error.code || 'wallet_persistence_failed',
+    });
   }
   return transaction;
 }
 
+function walletCommitDelta(args) {
+  return withWalletMutation(() => walletCommitDeltaUnlocked(args));
+}
+
 function walletEnroll(id, walletKey, recoveryKey, deviceId = '') {
-  const clean = normalizeId(id);
-  if (!validId(clean) || !validWalletKey(walletKey) || !validRecoveryKey(recoveryKey)) {
-    throw Object.assign(new Error('Geçerli RelaxFPS ID, cüzdan anahtarı ve kurtarma anahtarı gerekli.'), { code: 'invalid_wallet_credentials' });
-  }
-  const existing = walletRecord(clean);
-  if (existing) {
-    if (!walletKeyMatches(existing, walletKey)) {
-      throw Object.assign(new Error('Bu RelaxFPS ID için cüzdan zaten oluşturulmuş.'), { code: 'wallet_already_enrolled' });
+  return withWalletMutation(async () => {
+    const clean = normalizeId(id);
+    if (!validId(clean) || !validWalletKey(walletKey) || !validRecoveryKey(recoveryKey)) {
+      throw Object.assign(new Error('Geçerli RelaxFPS ID, cüzdan anahtarı ve kurtarma anahtarı gerekli.'), { code: 'invalid_wallet_credentials' });
     }
+    const existing = walletRecord(clean);
+    if (existing) {
+      if (!walletKeyMatches(existing, walletKey)) {
+        throw Object.assign(new Error('Bu RelaxFPS ID için cüzdan zaten oluşturulmuş.'), { code: 'wallet_already_enrolled' });
+      }
+      const deviceHash = walletDeviceHash(deviceId);
+      if (deviceHash) existing.devices = Array.from(new Set([...(existing.devices || []), deviceHash])).slice(-8);
+      existing.lastAccessAt = new Date().toISOString();
+      await saveStateDurable();
+      return { wallet: existing, created: false, transaction: null };
+    }
+
+    const cloudRecord = (state.cloudBackups || {})[clean] || null;
+    if (!cloudRecord) {
+      throw Object.assign(
+        new Error('Cüzdan oluşturmadan önce aynı kurtarma anahtarıyla bulut yedeği etkinleştirilmeli.'),
+        { code: 'recovery_binding_required' },
+      );
+    }
+    if (!cloudBackupKeyMatches(cloudRecord, recoveryKey)) {
+      throw Object.assign(new Error('Bulut yedeğindeki kurtarma anahtarıyla eşleşmedi.'), { code: 'recovery_key_mismatch' });
+    }
+
+    const stateBefore = JSON.parse(JSON.stringify({
+      wallets: state.wallets,
+      walletTransactions: state.walletTransactions,
+      walletRequestIndex: state.walletRequestIndex,
+      walletLedgerHead: state.walletLedgerHead,
+      walletLedgerSequence: state.walletLedgerSequence,
+      walletLedgerAnchor: state.walletLedgerAnchor,
+      walletLedgerKeyId: state.walletLedgerKeyId,
+    }));
+    const now = new Date().toISOString();
     const deviceHash = walletDeviceHash(deviceId);
-    if (deviceHash) existing.devices = Array.from(new Set([...(existing.devices || []), deviceHash])).slice(-8);
-    existing.lastAccessAt = new Date().toISOString();
-    saveStateSoon();
-    return { wallet: existing, created: false, transaction: null };
-  }
+    const wallet = {
+      id: clean,
+      balance: 0,
+      walletKeyHash: walletCredentialHash(normalizeWalletKey(walletKey), 'wallet-key'),
+      recoveryKeyHash: walletCredentialHash(normalizeRecoveryKey(recoveryKey), 'wallet-recovery'),
+      welcomeGranted: true,
+      createdAt: now,
+      updatedAt: now,
+      lastAccessAt: now,
+      lastTransactionId: '',
+      devices: deviceHash ? [deviceHash] : [],
+      locked: false,
+      lockedUntil: '',
+      lockReason: '',
+      riskScore: 0,
+    };
+    state.wallets[clean] = wallet;
 
-  const cloudRecord = (state.cloudBackups || {})[clean] || null;
-  if (!cloudRecord) {
-    throw Object.assign(
-      new Error('Cüzdan oluşturmadan önce aynı kurtarma anahtarıyla bulut yedeği etkinleştirilmeli.'),
-      { code: 'recovery_binding_required' },
-    );
-  }
-  if (!cloudBackupKeyMatches(cloudRecord, recoveryKey)) {
-    throw Object.assign(new Error('Bulut yedeğindeki kurtarma anahtarıyla eşleşmedi.'), { code: 'recovery_key_mismatch' });
-  }
-
-  const now = new Date().toISOString();
-  const deviceHash = walletDeviceHash(deviceId);
-  const wallet = {
-    id: clean,
-    balance: 0,
-    walletKeyHash: walletCredentialHash(normalizeWalletKey(walletKey), 'wallet-key'),
-    recoveryKeyHash: walletCredentialHash(normalizeRecoveryKey(recoveryKey), 'wallet-recovery'),
-    welcomeGranted: false,
-    createdAt: now,
-    updatedAt: now,
-    lastAccessAt: now,
-    lastTransactionId: '',
-    devices: deviceHash ? [deviceHash] : [],
-    locked: false,
-    lockedUntil: '',
-    lockReason: '',
-    riskScore: 0,
-  };
-  state.wallets[clean] = wallet;
-
-  const settings = normalizeWalletSettings(state.walletSettings);
-  let transaction = null;
-  try {
-    const bonus = Math.max(0, Math.round(Number(settings.welcomeBonus || 0)));
-    if (bonus > 0) {
-      transaction = walletCommitDelta({
-        id: clean,
-        delta: bonus,
-        type: 'WELCOME_BONUS',
-        action: 'wallet_enroll',
-        requestId: `welcome-${clean}`,
-        source: 'server',
-        metadata: { cloudBackupBound: !!cloudRecord },
-      });
-    } else if (!saveStateNow()) {
-      throw Object.assign(new Error('Cüzdan güvenli şekilde kaydedilemedi.'), { code: 'wallet_persistence_failed' });
-    }
-    wallet.welcomeGranted = true;
-    wallet.updatedAt = new Date().toISOString();
-    if (!saveStateNow()) throw Object.assign(new Error('Hoş geldin ödülü durumu kaydedilemedi.'), { code: 'wallet_persistence_failed' });
-  } catch (error) {
-    delete state.wallets[clean];
-    if (transaction) {
-      state.walletTransactions = state.walletTransactions.filter((item) => item.id !== transaction.id);
-      rebuildWalletRequestIndex();
+    let transaction = null;
+    try {
+      const bonus = Math.max(0, Math.round(Number(normalizeWalletSettings(state.walletSettings).welcomeBonus || 0)));
+      if (bonus > 0) {
+        transaction = await walletCommitDeltaUnlocked({
+          id: clean,
+          delta: bonus,
+          type: 'WELCOME_BONUS',
+          action: 'wallet_enroll',
+          requestId: `welcome-${clean}`,
+          source: 'server',
+          metadata: { cloudBackupBound: true },
+        });
+      } else if (!await saveStateDurable()) {
+        throw Object.assign(new Error('Cüzdan güvenli şekilde kaydedilemedi.'), { code: 'wallet_persistence_failed' });
+      }
+    } catch (error) {
+      state.wallets = stateBefore.wallets;
+      state.walletTransactions = stateBefore.walletTransactions;
+      state.walletRequestIndex = stateBefore.walletRequestIndex;
+      state.walletLedgerHead = stateBefore.walletLedgerHead;
+      state.walletLedgerSequence = stateBefore.walletLedgerSequence;
+      state.walletLedgerAnchor = stateBefore.walletLedgerAnchor;
+      state.walletLedgerKeyId = stateBefore.walletLedgerKeyId;
       verifyWalletLedger();
+      writeLocalStateNow();
+      throw error;
     }
-    saveStateNow();
-    throw error;
-  }
-  walletSecurityEvent('wallet_enrolled', { id: clean, cloudBackupBound: !!cloudRecord }, 'info');
-  return { wallet, created: true, transaction };
+    walletSecurityEvent('wallet_enrolled', { id: clean, cloudBackupBound: true }, 'info');
+    return { wallet, created: true, transaction };
+  });
 }
 
 function walletRecover(id, recoveryKey, newWalletKey, deviceId = '') {
-  const clean = normalizeId(id);
-  const wallet = walletRecord(clean);
-  if (!wallet) throw Object.assign(new Error('Bu RelaxFPS ID için cüzdan bulunamadı.'), { code: 'wallet_not_enrolled' });
-  if (!validRecoveryKey(recoveryKey) || !validWalletKey(newWalletKey) || !walletRecoveryMatches(wallet, recoveryKey)) {
-    throw Object.assign(new Error('Kurtarma anahtarı yanlış.'), { code: 'recovery_key_mismatch' });
-  }
-  wallet.walletKeyHash = walletCredentialHash(normalizeWalletKey(newWalletKey), 'wallet-key');
-  const deviceHash = walletDeviceHash(deviceId);
-  if (deviceHash) wallet.devices = Array.from(new Set([...(wallet.devices || []), deviceHash])).slice(-8);
-  wallet.updatedAt = new Date().toISOString();
-  wallet.lastAccessAt = wallet.updatedAt;
-  if (!saveStateNow()) throw Object.assign(new Error('Yeni cihaz anahtarı kaydedilemedi.'), { code: 'wallet_persistence_failed' });
-  walletSecurityEvent('wallet_recovered', { id: clean, deviceAdded: !!deviceHash }, 'info');
-  return wallet;
+  return withWalletMutation(async () => {
+    const clean = normalizeId(id);
+    const wallet = walletRecord(clean);
+    if (!wallet) throw Object.assign(new Error('Bu RelaxFPS ID için cüzdan bulunamadı.'), { code: 'wallet_not_enrolled' });
+    if (!validRecoveryKey(recoveryKey) || !validWalletKey(newWalletKey) || !walletRecoveryMatches(wallet, recoveryKey)) {
+      throw Object.assign(new Error('Kurtarma anahtarı yanlış.'), { code: 'recovery_key_mismatch' });
+    }
+    const before = { walletKeyHash: wallet.walletKeyHash, devices: [...(wallet.devices || [])], updatedAt: wallet.updatedAt, lastAccessAt: wallet.lastAccessAt };
+    wallet.walletKeyHash = walletCredentialHash(normalizeWalletKey(newWalletKey), 'wallet-key');
+    const deviceHash = walletDeviceHash(deviceId);
+    if (deviceHash) wallet.devices = Array.from(new Set([...(wallet.devices || []), deviceHash])).slice(-8);
+    wallet.updatedAt = new Date().toISOString();
+    wallet.lastAccessAt = wallet.updatedAt;
+    try {
+      if (!await saveStateDurable()) throw new Error('State save failed');
+    } catch (error) {
+      Object.assign(wallet, before);
+      writeLocalStateNow();
+      throw Object.assign(new Error('Yeni cihaz anahtarı kalıcı veritabanına kaydedilemedi.'), { code: error.code || 'wallet_persistence_failed' });
+    }
+    walletSecurityEvent('wallet_recovered', { id: clean, deviceAdded: !!deviceHash }, 'info');
+    return wallet;
+  });
 }
+
 
 function walletHistory(id, limit = 50, beforeSequence = Number.MAX_SAFE_INTEGER) {
   const clean = normalizeId(id);
@@ -1651,6 +1996,7 @@ function adminSnapshot() {
       online: onlineIds().length,
       messages: Object.values(state.messages || {}).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0),
       dataFile: DATA_FILE,
+      persistence: { ...supabaseStatus, stateId: SUPABASE_STATE_ID },
       crashReports: (state.crashReports || []).length,
       clientEvents: (state.clientEvents || []).length,
       promoCodes: Object.keys(state.promoCodes || {}).length,
@@ -2102,18 +2448,12 @@ function communityInsights(manufacturer, model) {
   };
 }
 
-loadState();
-verifyWalletLedger();
-if (!WALLET_SECURITY_CONFIGURED) {
-  console.warn('[WALLET] RELAXFPS_WALLET_LEDGER_SECRET is not configured. Set a stable 32+ character secret before production use.');
-}
-
 wss.on('connection', (socket, request) => {
   let currentId = null;
   let adminSessionToken = null;
   const socketIp = requestIp(request || { headers: {}, socket: socket?._socket });
 
-  socket.on('message', (raw) => {
+  socket.on('message', async (raw) => {
     let data;
     try {
       data = JSON.parse(raw.toString());
@@ -2155,7 +2495,7 @@ wss.on('connection', (socket, request) => {
         return;
       }
       try {
-        const result = walletEnroll(id, data.walletKey, data.recoveryKey, data.deviceId);
+        const result = await walletEnroll(id, data.walletKey, data.recoveryKey, data.deviceId);
         setCurrentSocketIdentity(socket, id);
         sendTo(id, {
           type: 'wallet_changed',
@@ -2196,7 +2536,7 @@ wss.on('connection', (socket, request) => {
         return;
       }
       try {
-        walletRecover(id, data.recoveryKey, data.newWalletKey, data.deviceId);
+        await walletRecover(id, data.recoveryKey, data.newWalletKey, data.deviceId);
         setCurrentSocketIdentity(socket, id);
         walletClearAuthFailures(socketIp, id);
         sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: 'wallet_recovered', serverTime: new Date().toISOString() });
@@ -2292,7 +2632,7 @@ wss.on('connection', (socket, request) => {
       const price = Math.max(0, Math.round(Number(settings.prices[action] || 0)));
       const unlimited = !!isPremiumGranted(id) && settings.premiumUnlimited;
       try {
-        const transaction = walletCommitDelta({
+        const transaction = await walletCommitDelta({
           id,
           delta: unlimited ? 0 : -price,
           type: unlimited ? 'PREMIUM_BYPASS' : 'TOOL_SPEND',
@@ -2738,7 +3078,7 @@ wss.on('connection', (socket, request) => {
         return;
       }
       try {
-        const transaction = walletCommitDelta({
+        const transaction = await walletCommitDelta({
           id,
           delta: amount,
           type: amount > 0 ? 'ADMIN_CREDIT' : 'ADMIN_DEBIT',
@@ -2770,7 +3110,12 @@ wss.on('connection', (socket, request) => {
       wallet.lockReason = locked ? String(data.reason || 'Güvenlik kontrolü').slice(0, 240) : '';
       wallet.lockedUntil = locked && minutes > 0 ? new Date(Date.now() + minutes * 60 * 1000).toISOString() : '';
       wallet.updatedAt = new Date().toISOString();
-      saveStateNow();
+      try {
+        if (!await saveStateDurable()) throw new Error('State save failed');
+      } catch (error) {
+        send(socket, { type: 'admin_error', ok: false, requestId, code: error.code || 'wallet_persistence_failed', message: 'Cüzdan kilidi kalıcı veritabanına kaydedilemedi.' });
+        return;
+      }
       walletSecurityEvent(locked ? 'wallet_admin_locked' : 'wallet_admin_unlocked', { id, minutes, reason: wallet.lockReason }, locked ? 'high' : 'info');
       adminAudit('wallet_lock', { id, locked, minutes, reason: wallet.lockReason });
       sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: locked ? 'wallet_locked' : 'wallet_unlocked', serverTime: new Date().toISOString() });
@@ -2788,8 +3133,10 @@ wss.on('connection', (socket, request) => {
         prices: { ...current.prices, ...(incoming.prices && typeof incoming.prices === 'object' ? incoming.prices : {}) },
         updatedAt: new Date().toISOString(),
       });
-      if (!saveStateNow()) {
-        send(socket, { type: 'admin_error', ok: false, requestId, message: 'Cüzdan ayarları kaydedilemedi.' });
+      try {
+        if (!await saveStateDurable()) throw new Error('State save failed');
+      } catch (error) {
+        send(socket, { type: 'admin_error', ok: false, requestId, code: error.code || 'wallet_persistence_failed', message: 'Cüzdan ayarları kalıcı veritabanına kaydedilemedi.' });
         return;
       }
       adminAudit('wallet_settings_updated', { settings: walletSettingsSnapshot() });
@@ -2800,7 +3147,7 @@ wss.on('connection', (socket, request) => {
     if (type === 'admin_wallet_verify_ledger') {
       if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const result = verifyWalletLedger();
-      if (result.ok) saveStateNow();
+      if (result.ok) await saveStateDurable();
       adminAudit('wallet_ledger_verified', result);
       send(socket, { type: 'admin_wallet_verify_ledger', ok: result.ok, requestId, integrity: result });
       return;
@@ -3789,18 +4136,46 @@ setInterval(() => {
   }
 }, 10000).unref?.();
 
-function shutdown() {
+async function shutdown() {
   for (const id of Array.from(activeFriendUsage.keys())) stopFriendUsage(id);
-  saveStateNow();
+  writeLocalStateNow();
+  try {
+    if (SUPABASE_CONFIGURED) await flushSupabaseState({ required: true });
+  } catch (error) {
+    console.warn('[SUPABASE] Final shutdown save failed:', error.message);
+  }
   process.exit(0);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => { shutdown().catch(() => process.exit(1)); });
+process.on('SIGTERM', () => { shutdown().catch(() => process.exit(1)); });
 
-httpServer.listen(PORT, () => {
-  console.log(`RelaxFPS Friends Server v6.1-rfx-wallet running on ws://0.0.0.0:${PORT}`);
-  console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
-  if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
-  if (ADMIN_TOTP_SECRET) console.log('[SECURITY] Admin TOTP is enabled.');
+async function bootstrapServer() {
+  const localLoaded = loadState();
+  const cloudLoaded = await loadStateFromSupabase();
+  verifyWalletLedger();
+
+  if (!WALLET_SECURITY_CONFIGURED) {
+    console.warn('[WALLET] RELAXFPS_WALLET_LEDGER_SECRET is not configured. Set a stable 32+ character secret before production use.');
+  }
+  if (SUPABASE_SYNC_ENABLED && !SUPABASE_CONFIGURED) {
+    console.warn('[SUPABASE] Persistent storage is not configured. Set SUPABASE_URL and SUPABASE_SECRET_KEY (or legacy SUPABASE_SERVICE_ROLE_KEY). Wallet mutations will remain disabled.');
+  } else if (SUPABASE_CONFIGURED && !cloudLoaded) {
+    const seeded = await flushSupabaseState({ required: true });
+    if (seeded) console.log(`[SUPABASE] Created initial persistent state from ${localLoaded ? 'local data' : 'empty server state'}.`);
+  }
+
+  httpServer.listen(PORT, () => {
+    console.log(`RelaxFPS Friends Server v6.2-rfx-supabase running on ws://0.0.0.0:${PORT}`);
+    console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
+    console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
+    if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
+    if (ADMIN_TOTP_SECRET) console.log('[SECURITY] Admin TOTP is enabled.');
+  });
+}
+
+bootstrapServer().catch((error) => {
+  console.error('[BOOT] Server could not start safely:', error);
+  process.exit(1);
 });
+

@@ -279,12 +279,14 @@ function statCard(label, value, note, accent = 'green') {
 function renderOverview() {
   const health = snapshot.systemHealth || {};
   const analytics = snapshot.analytics || {};
+  const persistence = health.persistence || {};
+  const persistenceReady = persistence.configured && persistence.connected && !persistence.conflict;
   pageContent.innerHTML = `
     <div class="grid stats-grid">
       ${statCard('Kayıtlı kullanıcı', health.profiles || (snapshot.users || []).length, `${health.online || 0} çevrim içi`, 'green')}
       ${statCard('Toplam mesaj', health.messages || 0, `${health.groups || 0} grup`, 'blue')}
       ${statCard('Premium kullanıcı', analytics.premiumTotal || (snapshot.premiumUsers || []).length, `${analytics.bannedTotal || 0} banlı`, 'orange')}
-      ${statCard('Hata raporu', analytics.crashTotal || (snapshot.crashReports || []).length, `${analytics.eventsLast24h || 0} olay / 24 saat`, 'red')}
+      ${statCard('Kalıcı veri', persistenceReady ? 'SUPABASE AKTİF' : 'KONTROL ET', `Sürüm ${persistence.revision || 0}`, persistenceReady ? 'green' : 'red')}
     </div>
     <div class="section-head"><div><h3>Sistem durumu</h3><p>Sunucunun canlı özet bilgileri</p></div></div>
     <div class="grid two-col">
@@ -294,7 +296,13 @@ function renderOverview() {
           ${infoRow('Çevrim içi', health.online || 0)}
           ${infoRow('Relay odaları', health.relayRooms || 0)}
           ${infoRow('Grup arama odaları', health.groupCallRooms || 0)}
-          ${infoRow('Veri dosyası', fmtBytes(health.dataFileBytes || 0))}
+          ${infoRow('Yerel veri dosyası', fmtBytes(health.dataFileBytes || 0))}
+          ${infoRow('Supabase bağlantısı', persistence.connected ? 'Bağlı' : 'Bağlı değil')}
+          ${infoRow('Bulut sürümü', persistence.revision || 0)}
+          ${infoRow('Son bulut kaydı', fmtDate(persistence.lastSaveAt))}
+          ${infoRow('Bekleyen değişiklik', persistence.dirty ? 'Var' : 'Yok')}
+          ${infoRow('Sürüm çakışması', persistence.conflict ? 'VAR — TOKEN DURDURULDU' : 'Yok')}
+          ${persistence.lastError ? infoRow('Son Supabase hatası', persistence.lastError) : ''}
           ${infoRow('Sunucu zamanı', fmtDate(snapshot.time))}
         </div>
       </section>
