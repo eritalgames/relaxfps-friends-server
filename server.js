@@ -98,6 +98,8 @@ const state = {
   dailyWheel: {}, // RelaxFPS ID -> persistent wheel state, history and temporary grants
   premiumDiscounts: {}, // RelaxFPS ID -> active Google Play offer entitlement
   flashOffers: {}, // RelaxFPS ID -> persistent 3-day flash offer schedule
+  cloudBackups: {}, // RelaxFPS ID -> {keyHash,backup,createdAt,updatedAt,sizeBytes,version}
+  communitySignals: {}, // RelaxFPS ID -> anonymized aggregate device/session signal
 };
 
 function loadState() {
@@ -129,6 +131,8 @@ function loadState() {
       state.dailyWheel = state.dailyWheel || {};
       state.premiumDiscounts = state.premiumDiscounts || {};
       state.flashOffers = state.flashOffers || {};
+      state.cloudBackups = state.cloudBackups || {};
+      state.communitySignals = state.communitySignals || {};
     }
   } catch (error) {
     console.warn('[STATE] Could not load data file:', error.message);
@@ -461,6 +465,24 @@ function normalizeId(value) {
 
 function validId(id) {
   return id.startsWith('RFX-') && id.length >= 8;
+}
+
+function normalizeRecoveryKey(value) {
+  return String(value || '').trim().toUpperCase().replace(/\s+/g, '');
+}
+
+function validRecoveryKey(value) {
+  const clean = normalizeRecoveryKey(value).replace(/-/g, '');
+  return clean.length >= 12 && clean.length <= 96 && /^[A-Z0-9]+$/.test(clean);
+}
+
+function recoveryKeyHash(value) {
+  return crypto.createHash('sha256').update(normalizeRecoveryKey(value), 'utf8').digest('hex');
+}
+
+function cloudBackupKeyMatches(record, recoveryKey) {
+  if (!record || !record.keyHash || !validRecoveryKey(recoveryKey)) return false;
+  return secureStringEqual(record.keyHash, recoveryKeyHash(recoveryKey));
 }
 
 function conversationKey(a, b) {
@@ -1266,6 +1288,130 @@ function benchmarkComparison(model, totalScore) {
   return { sampleCount: matching.length, average, differencePercent };
 }
 
+function maskedRelaxId(id) {
+  return String(id || '').replace(/^(RFX-\d{2})\d{2}-(\d{2})\d{2}$/, '$1**-$2**');
+}
+
+function friendBenchmarkEntries(requester) {
+  const clean = normalizeId(requester);
+  const ids = Array.from(new Set([clean, ...((state.friendships || {})[clean] || [])])).filter(validId);
+  const rows = ids.map((id) => {
+    const profile = publicProfile(id);
+    const bench = (state.benchmarkScores || {})[id] || null;
+    return {
+      id,
+      displayId: maskedRelaxId(id),
+      name: profile.name || 'Relax Friend',
+      online: !!profile.online,
+      mine: id === clean,
+      model: bench ? String(bench.model || 'Unknown device') : 'Benchmark yapılmadı',
+      manufacturer: bench ? String(bench.manufacturer || '') : '',
+      androidVersion: bench ? String(bench.androidVersion || '') : '',
+      totalScore: bench ? Number(bench.totalScore || 0) : 0,
+      categoryScores: bench && bench.categoryScores && typeof bench.categoryScores === 'object' ? bench.categoryScores : {},
+      updatedAt: bench ? String(bench.updatedAt || '') : '',
+      hasScore: !!bench && Number(bench.totalScore || 0) > 0,
+    };
+  });
+  rows.sort((a, b) => {
+    if (a.hasScore !== b.hasScore) return a.hasScore ? -1 : 1;
+    if (a.hasScore && b.hasScore) return b.totalScore - a.totalScore;
+    if (a.mine !== b.mine) return a.mine ? -1 : 1;
+    return a.name.localeCompare(b.name, 'tr');
+  });
+  let rank = 0;
+  return rows.map((item) => {
+    if (item.hasScore) rank += 1;
+    return { ...item, rank: item.hasScore ? rank : 0 };
+  });
+}
+
+function safeCommunityNumber(value, min, max) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(min, Math.min(number, max));
+}
+
+function communityInsights(manufacturer, model) {
+  const cleanManufacturer = String(manufacturer || '').trim().toLowerCase();
+  const cleanModel = String(model || '').trim().toLowerCase();
+  const cutoff = Date.now() - 120 * 24 * 60 * 60 * 1000;
+  const all = Object.values(state.communitySignals || {}).filter((item) => {
+    if (!item || Number(item.sessionCount || 0) <= 0) return false;
+    const updated = Date.parse(item.updatedAt || '') || 0;
+    return updated >= cutoff;
+  });
+  const sameModel = all.filter((item) => String(item.model || '').trim().toLowerCase() === cleanModel && cleanModel);
+  const sameManufacturer = all.filter((item) => String(item.manufacturer || '').trim().toLowerCase() === cleanManufacturer && cleanManufacturer);
+  let selected = sameModel;
+  let scope = cleanModel ? 'Aynı cihaz modeli' : 'Cihaz topluluğu';
+  if (selected.length < 2 && sameManufacturer.length >= 2) {
+    selected = sameManufacturer;
+    scope = 'Aynı üretici cihazları';
+  }
+  if (!selected.length) {
+    selected = all.slice(-30);
+    scope = 'Genel Android topluluğu';
+  }
+  if (!selected.length) {
+    return {
+      sampleCount: 0,
+      scope,
+      averageSessionScore: 0,
+      averageTemperature: 0,
+      averageBatteryPerHour: 0,
+      commonMode: 'Normal',
+      recommendations: [],
+      message: 'Henüz karşılaştırma için yeterli topluluk verisi yok.',
+    };
+  }
+  let totalWeight = 0;
+  let scoreSum = 0;
+  let tempSum = 0;
+  let tempWeight = 0;
+  let batterySum = 0;
+  let batteryWeight = 0;
+  const modes = {};
+  for (const item of selected) {
+    const weight = Math.max(1, Math.min(Number(item.sessionCount || 1), 12));
+    totalWeight += weight;
+    scoreSum += Number(item.averageSessionScore || 0) * weight;
+    const temp = Number(item.averageTemperature || 0);
+    if (temp > 0) {
+      tempSum += temp * weight;
+      tempWeight += weight;
+    }
+    const battery = Number(item.averageBatteryPerHour || 0);
+    if (battery > 0) {
+      batterySum += battery * weight;
+      batteryWeight += weight;
+    }
+    const mode = String(item.commonMode || 'Normal').slice(0, 32);
+    modes[mode] = Number(modes[mode] || 0) + weight;
+  }
+  const commonMode = Object.entries(modes).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Normal';
+  const averageSessionScore = totalWeight ? Math.round((scoreSum / totalWeight) * 10) / 10 : 0;
+  const averageTemperature = tempWeight ? Math.round((tempSum / tempWeight) * 10) / 10 : 0;
+  const averageBatteryPerHour = batteryWeight ? Math.round((batterySum / batteryWeight) * 10) / 10 : 0;
+  const recommendations = [];
+  if (averageTemperature >= 42) recommendations.push('Bu cihaz grubunda sıcaklık yüksek; Thermal Guard ve Normal/Tasarruf profili önerilir.');
+  else if (averageTemperature > 0) recommendations.push('Topluluk sıcaklık ortalaması dengeli görünüyor; uzun oturumlarda yine termal takibi açık tut.');
+  if (averageBatteryPerHour >= 28) recommendations.push('Saatlik pil tüketimi yüksek; parlaklığı azaltmak ve Tasarruf modunu denemek faydalı olabilir.');
+  if (averageSessionScore < 70) recommendations.push('Topluluk oturum puanı orta seviyede; oyun öncesi hazırlık ve ağ testiyle başla.');
+  if (commonMode) recommendations.push(`Bu cihaz grubunda en yaygın profil: ${commonMode}.`);
+  if (recommendations.length < 2) recommendations.push('Ayarları tek seferde değiştirmek yerine her oturumdan sonra raporu karşılaştır.');
+  return {
+    sampleCount: selected.length,
+    scope,
+    averageSessionScore,
+    averageTemperature,
+    averageBatteryPerHour,
+    commonMode,
+    recommendations: recommendations.slice(0, 4),
+    message: '',
+  };
+}
+
 loadState();
 
 wss.on('connection', (socket) => {
@@ -1298,6 +1444,81 @@ wss.on('connection', (socket) => {
 
     if (type === 'get_app_config') {
       send(socket, { type: 'app_config', ok: true, requestId, settings: normalizeAppSettings(state.appSettings), time: new Date().toISOString() });
+      return;
+    }
+
+    if (type === 'cloud_backup_put') {
+      const id = normalizeId(data.id || currentId);
+      const recoveryKey = normalizeRecoveryKey(data.recoveryKey);
+      const backup = data.backup;
+      if (!validId(id) || !validRecoveryKey(recoveryKey)) {
+        send(socket, { type: 'cloud_backup_put', ok: false, requestId, message: 'Geçerli RelaxFPS ID ve kurtarma anahtarı gerekli.' });
+        return;
+      }
+      if (!backup || typeof backup !== 'object' || Array.isArray(backup)) {
+        send(socket, { type: 'cloud_backup_put', ok: false, requestId, message: 'Geçerli yedek verisi gerekli.' });
+        return;
+      }
+      let serialized;
+      try {
+        serialized = JSON.stringify(backup);
+      } catch (_) {
+        send(socket, { type: 'cloud_backup_put', ok: false, requestId, message: 'Yedek verisi işlenemedi.' });
+        return;
+      }
+      const sizeBytes = Buffer.byteLength(serialized, 'utf8');
+      if (sizeBytes < 2 || sizeBytes > 800 * 1024) {
+        send(socket, { type: 'cloud_backup_put', ok: false, requestId, message: 'Yedek boyutu 800 KB sınırını aşıyor.' });
+        return;
+      }
+      state.cloudBackups = state.cloudBackups || {};
+      const existing = state.cloudBackups[id] || null;
+      if (existing && !cloudBackupKeyMatches(existing, recoveryKey)) {
+        send(socket, { type: 'cloud_backup_put', ok: false, requestId, message: 'Kurtarma anahtarı yanlış.' });
+        return;
+      }
+      const now = new Date().toISOString();
+      state.cloudBackups[id] = {
+        keyHash: recoveryKeyHash(recoveryKey),
+        backup,
+        createdAt: existing && existing.createdAt ? existing.createdAt : now,
+        updatedAt: now,
+        sizeBytes,
+        version: Math.max(1, Math.min(Number(backup.version || 1), 50)),
+      };
+      saveStateSoon();
+      send(socket, { type: 'cloud_backup_put', ok: true, requestId, updatedAt: now, sizeBytes, version: state.cloudBackups[id].version, serverTime: now });
+      return;
+    }
+
+    if (type === 'cloud_backup_get' || type === 'cloud_backup_status') {
+      const id = normalizeId(data.id || currentId);
+      const recoveryKey = normalizeRecoveryKey(data.recoveryKey);
+      const record = (state.cloudBackups || {})[id] || null;
+      if (!validId(id) || !validRecoveryKey(recoveryKey)) {
+        send(socket, { type, ok: false, requestId, message: 'Geçerli RelaxFPS ID ve kurtarma anahtarı gerekli.' });
+        return;
+      }
+      if (!record) {
+        send(socket, { type, ok: false, requestId, message: 'Bu RelaxFPS ID için bulut yedeği bulunamadı.' });
+        return;
+      }
+      if (!cloudBackupKeyMatches(record, recoveryKey)) {
+        send(socket, { type, ok: false, requestId, message: 'Kurtarma anahtarı yanlış.' });
+        return;
+      }
+      const response = {
+        type,
+        ok: true,
+        requestId,
+        createdAt: record.createdAt || '',
+        updatedAt: record.updatedAt || '',
+        sizeBytes: Number(record.sizeBytes || 0),
+        version: Number(record.version || 1),
+        serverTime: new Date().toISOString(),
+      };
+      if (type === 'cloud_backup_get') response.backup = record.backup || {};
+      send(socket, response);
       return;
     }
 
@@ -1339,6 +1560,70 @@ wss.on('connection', (socket) => {
       const rank = all.findIndex((entry) => entry.id === id) + 1;
       const comparison = benchmarkComparison(item.model, item.totalScore);
       send(socket, { type: 'bench_submit', ok: true, requestId, item, previous, rank, comparison, leaderboard: all.slice(0, 100), totalDevices: all.length });
+      return;
+    }
+
+    if (type === 'friend_benchmarks') {
+      const requester = normalizeId(currentId || data.id);
+      if (!validId(requester) || currentId !== requester) {
+        send(socket, { type: 'friend_benchmarks', ok: false, requestId, message: 'Önce geçerli RelaxFPS kimliğiyle bağlan.' });
+        return;
+      }
+      const entries = friendBenchmarkEntries(requester);
+      send(socket, {
+        type: 'friend_benchmarks',
+        ok: true,
+        requestId,
+        entries,
+        groupSize: entries.length,
+        scoredCount: entries.filter((item) => item.hasScore).length,
+        serverTime: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === 'device_community_submit') {
+      const id = normalizeId(currentId || data.id);
+      if (!validId(id) || currentId !== id) {
+        send(socket, { type: 'device_community_submit', ok: false, requestId, message: 'Önce geçerli RelaxFPS kimliğiyle bağlan.' });
+        return;
+      }
+      const item = {
+        id,
+        manufacturer: String(data.manufacturer || '').slice(0, 80),
+        model: String(data.model || 'Unknown device').slice(0, 120),
+        androidVersion: String(data.androidVersion || '').slice(0, 40),
+        sessionCount: Math.round(safeCommunityNumber(data.sessionCount, 1, 100)),
+        averageSessionScore: safeCommunityNumber(data.averageSessionScore, 0, 100),
+        averageTemperature: safeCommunityNumber(data.averageTemperature, 0, 90),
+        averageBatteryPerHour: safeCommunityNumber(data.averageBatteryPerHour, 0, 100),
+        commonMode: String(data.commonMode || 'Normal').slice(0, 32),
+        updatedAt: new Date().toISOString(),
+      };
+      state.communitySignals = state.communitySignals || {};
+      state.communitySignals[id] = item;
+      saveStateSoon();
+      send(socket, { type: 'device_community_submit', ok: true, requestId, updatedAt: item.updatedAt, serverTime: item.updatedAt });
+      return;
+    }
+
+    if (type === 'device_community_insights') {
+      const id = normalizeId(currentId || data.id);
+      if (!validId(id) || currentId !== id) {
+        send(socket, { type: 'device_community_insights', ok: false, requestId, message: 'Önce geçerli RelaxFPS kimliğiyle bağlan.' });
+        return;
+      }
+      const profile = state.profiles[id] || {};
+      const ownSignal = (state.communitySignals || {})[id] || {};
+      const manufacturer = String(data.manufacturer || ownSignal.manufacturer || profile.manufacturer || '');
+      const model = String(data.model || ownSignal.model || profile.deviceModel || '');
+      send(socket, {
+        type: 'device_community_insights',
+        ok: true,
+        requestId,
+        ...communityInsights(manufacturer, model),
+        serverTime: new Date().toISOString(),
+      });
       return;
     }
 
