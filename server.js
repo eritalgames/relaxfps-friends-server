@@ -1028,6 +1028,7 @@ function friendUsageRecord(id, timezoneOffsetMinutes = 0) {
     state.friendUsage[clean] = {
       day,
       usedSeconds: 0,
+      tokenBonusSeconds: 0,
       timezoneOffsetMinutes: offset,
       updatedAt: new Date().toISOString(),
     };
@@ -1088,7 +1089,8 @@ function friendUsageSnapshot(id, timezoneOffsetMinutes = null) {
   const onlineBonusSeconds = Number(wheel.grants?.onlineBonusUntil || 0) > Date.now()
     ? Math.max(0, Number(wheel.grants?.onlineBonusSeconds || 0))
     : 0;
-  const limitSeconds = Math.max(0, Math.round(minutes * 60) + onlineBonusSeconds);
+  const tokenBonusSeconds = Math.max(0, Number(record.tokenBonusSeconds || 0));
+  const limitSeconds = Math.max(0, Math.round(minutes * 60) + onlineBonusSeconds + tokenBonusSeconds);
   const usedSeconds = Math.max(0, Number(record.usedSeconds || 0));
   return {
     id: clean,
@@ -1099,6 +1101,7 @@ function friendUsageSnapshot(id, timezoneOffsetMinutes = null) {
     timezoneOffsetMinutes: Number(record.timezoneOffsetMinutes || 0),
     premium,
     onlineBonusSeconds,
+    tokenBonusSeconds,
     updatedAt: record.updatedAt || new Date().toISOString(),
   };
 }
@@ -1815,6 +1818,75 @@ function walletHistory(id, limit = 50, beforeSequence = Number.MAX_SAFE_INTEGER)
       metadata: item.metadata || {},
       createdAt: item.createdAt,
     }));
+}
+
+
+function walletServerBonusSeconds(action) {
+  const key = walletActionKey(action);
+  if (key === 'server_10m') return 10 * 60;
+  if (key === 'server_30m') return 30 * 60;
+  if (key === 'server_2h') return 2 * 60 * 60;
+  if (key === 'server_24h') return 24 * 60 * 60;
+  return 0;
+}
+
+function walletCommitSpendAction({ id, action, operationId, price, unlimited, metadata, timezoneOffsetMinutes }) {
+  return withWalletMutation(async () => {
+    const existing = walletFindTransaction(id, operationId);
+    if (existing) {
+      if (existing.action !== action) {
+        throw Object.assign(new Error('Aynı operationId farklı bir işlemde kullanılamaz.'), {
+          code: 'request_replay_mismatch',
+        });
+      }
+      return {
+        transaction: existing,
+        duplicate: true,
+        friendUsage: walletServerBonusSeconds(action) > 0 ? friendUsageSnapshot(id, timezoneOffsetMinutes) : null,
+      };
+    }
+
+    const serverBonusSeconds = walletServerBonusSeconds(action);
+    let usageRecord = null;
+    let previousTokenBonusSeconds = 0;
+    if (serverBonusSeconds > 0) {
+      usageRecord = friendUsageRecord(id, timezoneOffsetMinutes);
+      previousTokenBonusSeconds = Math.max(0, Number(usageRecord.tokenBonusSeconds || 0));
+      usageRecord.tokenBonusSeconds = previousTokenBonusSeconds + serverBonusSeconds;
+      usageRecord.updatedAt = new Date().toISOString();
+    }
+
+    try {
+      const transaction = await walletCommitDeltaUnlocked({
+        id,
+        delta: unlimited ? 0 : -price,
+        type: serverBonusSeconds > 0
+          ? 'SERVER_TIME_SPEND'
+          : (unlimited ? 'PREMIUM_BYPASS' : 'TOOL_SPEND'),
+        action,
+        requestId: operationId,
+        source: 'app',
+        metadata: {
+          ...normalizeWalletMetadata(metadata),
+          price,
+          premium: unlimited,
+          serverBonusSeconds,
+        },
+      });
+      return {
+        transaction,
+        duplicate: false,
+        friendUsage: serverBonusSeconds > 0 ? friendUsageSnapshot(id, timezoneOffsetMinutes) : null,
+      };
+    } catch (error) {
+      if (usageRecord) {
+        usageRecord.tokenBonusSeconds = previousTokenBonusSeconds;
+        usageRecord.updatedAt = new Date().toISOString();
+        writeLocalStateNow();
+      }
+      throw error;
+    }
+  });
 }
 
 function walletAuthenticate(socket, ip, id, walletKey, requestId, responseType) {
@@ -2625,22 +2697,29 @@ wss.on('connection', (socket, request) => {
             createdAt: existing.createdAt,
           },
           wallet: walletPublicSnapshot(id),
+          friendUsage: walletServerBonusSeconds(action) > 0
+            ? friendUsageSnapshot(id, data.timezoneOffsetMinutes)
+            : undefined,
           serverTime: new Date().toISOString(),
         });
         return;
       }
       const price = Math.max(0, Math.round(Number(settings.prices[action] || 0)));
-      const unlimited = !!isPremiumGranted(id) && settings.premiumUnlimited;
+      const serverBonusSeconds = walletServerBonusSeconds(action);
+      // Premium bypass applies to tools/optimizations. Server-time packages are
+      // always charged until Google Play entitlement verification arrives in Token D.
+      const unlimited = !!isPremiumGranted(id) && settings.premiumUnlimited && serverBonusSeconds <= 0;
       try {
-        const transaction = await walletCommitDelta({
+        const spendResult = await walletCommitSpendAction({
           id,
-          delta: unlimited ? 0 : -price,
-          type: unlimited ? 'PREMIUM_BYPASS' : 'TOOL_SPEND',
           action,
-          requestId: operationId,
-          source: 'app',
-          metadata: { ...normalizeWalletMetadata(data.metadata), price, premium: unlimited },
+          operationId,
+          price,
+          unlimited,
+          metadata: data.metadata,
+          timezoneOffsetMinutes: data.timezoneOffsetMinutes,
         });
+        const transaction = spendResult.transaction;
         sendTo(id, {
           type: 'wallet_changed',
           wallet: walletPublicSnapshot(id),
@@ -2657,8 +2736,9 @@ wss.on('connection', (socket, request) => {
         send(socket, {
           type: 'wallet_spend',
           ok: true,
+          duplicate: spendResult.duplicate === true,
           requestId,
-          charged: !unlimited,
+          charged: !unlimited && price > 0,
           price,
           transaction: {
             id: transaction.id,
@@ -2670,6 +2750,7 @@ wss.on('connection', (socket, request) => {
             createdAt: transaction.createdAt,
           },
           wallet: walletPublicSnapshot(id),
+          friendUsage: spendResult.friendUsage || undefined,
           serverTime: new Date().toISOString(),
         });
       } catch (error) {
