@@ -272,6 +272,7 @@ function defaultWalletSettings() {
       server_20m: 170,
       server_1h: 450,
       premium_tool_trial: 250,
+      issue_diagnosis: 20,
     },
     updatedAt: '',
   };
@@ -336,6 +337,7 @@ const state = {
   groupMessages: {}, // groupId -> message payloads
   friendUsage: {}, // RelaxFPS ID -> {day,usedSeconds,timezoneOffsetMinutes,updatedAt}
   dailyWheel: {}, // RelaxFPS ID -> persistent wheel state, history and temporary grants
+  dailyTasks: {}, // RelaxFPS ID -> server-authoritative daily task streak and progress
   premiumDiscounts: {}, // RelaxFPS ID -> active Google Play offer entitlement
   flashOffers: {}, // RelaxFPS ID -> persistent 3-day flash offer schedule
   cloudBackups: {}, // RelaxFPS ID -> {keyHash,backup,createdAt,updatedAt,sizeBytes,version}
@@ -392,6 +394,7 @@ function applyLoadedState(parsed) {
   state.groupMessages = state.groupMessages || {};
   state.friendUsage = state.friendUsage || {};
   state.dailyWheel = state.dailyWheel || {};
+  state.dailyTasks = state.dailyTasks && typeof state.dailyTasks === 'object' ? state.dailyTasks : {};
   state.premiumDiscounts = state.premiumDiscounts || {};
   state.flashOffers = state.flashOffers || {};
   state.cloudBackups = state.cloudBackups || {};
@@ -937,7 +940,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.8.0-rfx-economy',
+      version: '6.9.0-daily-tasks',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -3741,6 +3744,7 @@ function adminSnapshot() {
       clientEvents: (state.clientEvents || []).length,
       promoCodes: Object.keys(state.promoCodes || {}).length,
       wheelUsers: Object.keys(state.dailyWheel || {}).length,
+      dailyTaskUsers: Object.keys(state.dailyTasks || {}).length,
       activeDiscounts: Object.keys(state.premiumDiscounts || {}).length,
       wallets: Object.keys(state.wallets || {}).length,
       walletTransactions: (state.walletTransactions || []).length,
@@ -4074,6 +4078,572 @@ async function applyDailyWheelReward(id, reward) {
   record.updatedAt = new Date(now).toISOString();
   saveStateSoon();
   return historyItem;
+}
+
+
+const DAILY_TASK_EVENT_LIMIT = 240;
+const DAILY_TASK_HISTORY_LIMIT = 35;
+const dailyTaskMutationChains = new Map();
+
+function withDailyTaskMutation(id, task) {
+  const clean = normalizeId(id);
+  const previous = dailyTaskMutationChains.get(clean) || Promise.resolve();
+  const run = previous.then(task, task);
+  const settled = run.catch(() => {});
+  dailyTaskMutationChains.set(clean, settled);
+  settled.finally(() => {
+    if (dailyTaskMutationChains.get(clean) === settled) dailyTaskMutationChains.delete(clean);
+  });
+  return run;
+}
+
+function dailyTaskDayKey(timezoneOffsetMinutes = 0, nowMs = Date.now()) {
+  const shifted = new Date(nowMs + normalizeTimezoneOffset(timezoneOffsetMinutes) * 60 * 1000);
+  return shifted.toISOString().slice(0, 10);
+}
+
+function dailyTaskDayNumber(dayKey) {
+  const parsed = Date.parse(`${String(dayKey || '')}T00:00:00.000Z`);
+  return Number.isFinite(parsed) ? Math.floor(parsed / 86400000) : 0;
+}
+
+function dailyTaskCurrentSeriesDay(record) {
+  const streak = Math.max(0, Math.round(Number(record?.streakDays || 0)));
+  if (record?.completedToday === true && streak > 0) return ((streak - 1) % 7) + 1;
+  return (streak % 7) + 1;
+}
+
+function dailyTaskCycleNumber(record) {
+  const streak = Math.max(0, Math.round(Number(record?.streakDays || 0)));
+  if (record?.completedToday === true && streak > 0) return Math.max(1, Math.ceil(streak / 7));
+  return Math.floor(streak / 7) + 1;
+}
+
+function dailyTaskRewardForCompletion(streakAfter) {
+  const streak = Math.max(0, Math.round(Number(streakAfter || 0)));
+  if (!streak || streak % 7 !== 0) {
+    return { weekly: 0, achievement: 0, total: 0, cycle: Math.max(1, Math.ceil(streak / 7)) };
+  }
+  const cycle = Math.max(1, Math.ceil(streak / 7));
+  const weekly = cycle === 1 ? 500 : cycle === 2 ? 1000 : cycle === 3 ? 2000 : 4000;
+  const achievement = streak % 28 === 0 ? 5000 : 0;
+  return { weekly, achievement, total: weekly + achievement, cycle };
+}
+
+function dailyTaskNextRewardPreview(record) {
+  const streak = Math.max(0, Math.round(Number(record?.streakDays || 0)));
+  // Tamamlanmış bir 7 günlük serinin ardından sıradaki turu göster.
+  const cycle = Math.floor(streak / 7) + 1;
+  const weekly = cycle === 1 ? 500 : cycle === 2 ? 1000 : cycle === 3 ? 2000 : 4000;
+  const remainder = streak % 28;
+  const daysUntilAchievement = remainder === 0 ? 28 : 28 - remainder;
+  return {
+    cycle,
+    weekly,
+    achievement: 5000,
+    daysUntilAchievement: Math.max(1, daysUntilAchievement),
+  };
+}
+
+function dailyTaskRecord(id, timezoneOffsetMinutes = 0) {
+  const clean = normalizeId(id);
+  state.dailyTasks = state.dailyTasks && typeof state.dailyTasks === 'object' ? state.dailyTasks : {};
+  const requestedOffset = normalizeTimezoneOffset(timezoneOffsetMinutes);
+  let record = state.dailyTasks[clean];
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    record = {
+      id: clean,
+      timezoneOffsetMinutes: requestedOffset,
+      currentDayKey: dailyTaskDayKey(requestedOffset),
+      streakDays: 0,
+      completedTotal: 0,
+      completedToday: false,
+      completedAt: '',
+      lastCompletedDayKey: '',
+      progress: {},
+      unique: {},
+      eventIds: [],
+      history: [],
+      updatedAt: new Date().toISOString(),
+    };
+    state.dailyTasks[clean] = record;
+  }
+
+  record.timezoneOffsetMinutes = normalizeTimezoneOffset(record.timezoneOffsetMinutes ?? requestedOffset);
+  record.streakDays = Math.max(0, Math.round(Number(record.streakDays || 0)));
+  record.completedTotal = Math.max(0, Math.round(Number(record.completedTotal || 0)));
+  record.completedToday = record.completedToday === true;
+  record.progress = record.progress && typeof record.progress === 'object' ? record.progress : {};
+  record.unique = record.unique && typeof record.unique === 'object' ? record.unique : {};
+  record.eventIds = Array.isArray(record.eventIds) ? record.eventIds.slice(-DAILY_TASK_EVENT_LIMIT) : [];
+  record.history = Array.isArray(record.history) ? record.history.slice(-DAILY_TASK_HISTORY_LIMIT) : [];
+
+  const candidateDay = dailyTaskDayKey(requestedOffset);
+  const currentDay = String(record.currentDayKey || candidateDay);
+  const difference = dailyTaskDayNumber(candidateDay) - dailyTaskDayNumber(currentDay);
+  if (difference > 0) {
+    if (difference > 1 || record.completedToday !== true) record.streakDays = 0;
+    record.currentDayKey = candidateDay;
+    record.timezoneOffsetMinutes = requestedOffset;
+    record.completedToday = false;
+    record.completedAt = '';
+    record.progress = {};
+    record.unique = {};
+    record.eventIds = [];
+    record.updatedAt = new Date().toISOString();
+    saveStateSoon();
+  } else if (!record.currentDayKey) {
+    record.currentDayKey = candidateDay;
+  }
+  return record;
+}
+
+function dailyTaskHasFriends(id) {
+  return Array.isArray(state.friendships?.[normalizeId(id)]) && state.friendships[normalizeId(id)].length > 0;
+}
+
+function dailyTaskDefinition(id, record) {
+  const day = dailyTaskCurrentSeriesDay(record);
+  const cycle = dailyTaskCycleNumber(record);
+  const variant = (cycle - 1) % 3;
+  const base = { day, cycle };
+  const task = (idValue, title, titleEn, description, descriptionEn, requirements) => ({
+    ...base,
+    id: idValue,
+    title,
+    titleEn,
+    description,
+    descriptionEn,
+    requirements,
+  });
+  const req = (key, label, labelEn, target = 1, kind = 'count') => ({
+    key,
+    label,
+    labelEn,
+    target,
+    kind,
+  });
+
+  // Her yeni 7 günlük seride görev havuzu deterministik olarak değişir.
+  // Böylece kullanıcı aynı haftayı sürekli tekrar etmez; ilerleme yine sunucuda tutulur.
+  if (variant === 1) {
+    if (day === 1) return task(
+      'start_one_game',
+      'Bir oyun başlat',
+      'Start one game',
+      'Kütüphanendeki bir oyunu RELAXFPS üzerinden başlat.',
+      'Launch one game from your RELAXFPS library.',
+      [req('game_started', 'Oyunu RELAXFPS üzerinden başlat', 'Launch a game through RELAXFPS')],
+    );
+    if (day === 2) return task(
+      'read_announcements_alt',
+      'İki farklı duyuruyu incele',
+      'Read two different announcements',
+      'Ana sayfadaki iki farklı duyurunun ayrıntılarını oku.',
+      'Open and read the details of two different announcements.',
+      [req('announcement_read', 'Farklı duyuru oku', 'Read different announcements', 2, 'unique')],
+    );
+    if (day === 3) return task(
+      'boost_and_tool',
+      'Boost ve araç görevi',
+      'Boost and tool task',
+      'Bir boost tamamla ve ardından bir araç işlemini bitir.',
+      'Complete one boost and one tool action.',
+      [
+        req('boost_complete', 'Boost tamamla', 'Complete a boost'),
+        req('tool_used', 'Bir araç kullan', 'Use one tool', 1, 'unique'),
+      ],
+    );
+    if (day === 4) return task(
+      'routine_and_game_alt',
+      'Rutinini kaydet ve oyuna gir',
+      'Save a routine and launch a game',
+      'Bir oyun rutinini kaydet, sonra aynı gün bir oyun başlat.',
+      'Save a game routine, then launch a game on the same day.',
+      [
+        req('routine_saved', 'Oyun rutinini kaydet', 'Save a game routine'),
+        req('game_started', 'Bir oyun başlat', 'Launch a game'),
+      ],
+    );
+    if (day === 5) return task(
+      'two_tools_alt',
+      'İki farklı araç kullan',
+      'Use two different tools',
+      'Araçlar bölümünde iki farklı işlemi tamamla.',
+      'Complete actions in two different tools.',
+      [req('tool_used', 'Farklı araç kullan', 'Use different tools', 2, 'unique')],
+    );
+    if (day === 6 && dailyTaskHasFriends(id)) return task(
+      'friends_active_alt',
+      'Arkadaşlar bölümünde aktif kal',
+      'Stay active in Friends',
+      'Arkadaşlar sunucusunda bugün toplam 10 dakika aktif kal.',
+      'Stay active on the Friends server for 10 minutes today.',
+      [req('friends_active_seconds', 'Aktif süre', 'Active time', 600, 'derived_friends')],
+    );
+    if (day === 6) return task(
+      'boost_and_game_fallback',
+      'Boost yap ve oyun başlat',
+      'Boost and launch a game',
+      'Henüz arkadaşın olmadığı için görev bir boost ve oyun başlangıcı olarak uyarlandı.',
+      'Because you have no friends yet, this task was adapted to a boost and game launch.',
+      [
+        req('boost_complete', 'Boost tamamla', 'Complete a boost'),
+        req('game_started', 'Bir oyun başlat', 'Launch a game'),
+      ],
+    );
+    return task(
+      'weekly_combo_alt',
+      'Alternatif final görevini tamamla',
+      'Complete the alternate final task',
+      'Bir boost, bir duyuru ve bir araç işlemini aynı gün tamamla.',
+      'Complete one boost, one announcement and one tool action on the same day.',
+      [
+        req('boost_complete', 'Boost tamamla', 'Complete a boost'),
+        req('announcement_read', 'Bir duyuru oku', 'Read one announcement', 1, 'unique'),
+        req('tool_used', 'Bir araç kullan', 'Use one tool', 1, 'unique'),
+      ],
+    );
+  }
+
+  if (variant === 2) {
+    if (day === 1) return task(
+      'tool_once',
+      'Bir araç işlemini tamamla',
+      'Complete one tool action',
+      'Araçlar bölümünden bir aracı kullan ve işlemi tamamla.',
+      'Use one tool and complete its action.',
+      [req('tool_used', 'Bir araç kullan', 'Use one tool', 1, 'unique')],
+    );
+    if (day === 2) return task(
+      'boost_and_game',
+      'Boost yap ve oyuna gir',
+      'Boost and launch a game',
+      'Bir boost tamamla ve ardından bir oyun başlat.',
+      'Complete a boost and then launch a game.',
+      [
+        req('boost_complete', 'Boost tamamla', 'Complete a boost'),
+        req('game_started', 'Bir oyun başlat', 'Launch a game'),
+      ],
+    );
+    if (day === 3) return task(
+      'read_announcements_third',
+      'İki duyuru oku',
+      'Read two announcements',
+      'İki farklı duyurunun ayrıntılarını incele.',
+      'Read the details of two different announcements.',
+      [req('announcement_read', 'Farklı duyuru oku', 'Read different announcements', 2, 'unique')],
+    );
+    if (day === 4) return task(
+      'routine_and_game_third',
+      'Oyun rutinini hazırla',
+      'Prepare a game routine',
+      'Bir oyun rutinini kaydet ve oyunu RELAXFPS üzerinden başlat.',
+      'Save a game routine and launch the game through RELAXFPS.',
+      [
+        req('routine_saved', 'Oyun rutinini kaydet', 'Save a game routine'),
+        req('game_started', 'Oyunu başlat', 'Launch the game'),
+      ],
+    );
+    if (day === 5) return task(
+      'social_profile_third',
+      'Sosyal hesabını geliştir',
+      'Improve your social profile',
+      'Bir arkadaş ekle veya profil adını tamamla.',
+      'Add a friend or complete your profile name.',
+      [req('social_action', 'Arkadaş ekle veya profili tamamla', 'Add a friend or complete your profile', 1, 'derived_social')],
+    );
+    if (day === 6 && dailyTaskHasFriends(id)) return task(
+      'friends_active_third',
+      'Arkadaşlarla aktif kal',
+      'Stay active with friends',
+      'Arkadaşlar sunucusunda bugün toplam 10 dakika aktif kal.',
+      'Stay active on the Friends server for 10 minutes today.',
+      [req('friends_active_seconds', 'Aktif süre', 'Active time', 600, 'derived_friends')],
+    );
+    if (day === 6) return task(
+      'announcement_fallback',
+      'İki farklı duyuru oku',
+      'Read two different announcements',
+      'Henüz arkadaşın olmadığı için görev duyuru okuma olarak uyarlandı.',
+      'Because you have no friends yet, this task was adapted to reading announcements.',
+      [req('announcement_read', 'Farklı duyuru oku', 'Read different announcements', 2, 'unique')],
+    );
+    return task(
+      'weekly_combo_third',
+      'Üçüncü final görevini tamamla',
+      'Complete the third final task',
+      'Bir rutin kaydet, bir araç kullan ve bir oyun başlat.',
+      'Save a routine, use one tool and launch a game.',
+      [
+        req('routine_saved', 'Oyun rutinini kaydet', 'Save a game routine'),
+        req('tool_used', 'Bir araç kullan', 'Use one tool', 1, 'unique'),
+        req('game_started', 'Bir oyun başlat', 'Launch a game'),
+      ],
+    );
+  }
+
+  if (day === 1) return task(
+    'boost_once',
+    'Bir boost tamamla',
+    'Complete one boost',
+    'Ana sayfadaki optimizasyonu başarıyla tamamla.',
+    'Successfully complete the optimization on the home screen.',
+    [req('boost_complete', 'Boost tamamla', 'Complete a boost')],
+  );
+  if (day === 2) return task(
+    'two_tools',
+    'İki farklı araç kullan',
+    'Use two different tools',
+    'Araçlar bölümünde iki farklı işlemi tamamla.',
+    'Complete actions in two different tools.',
+    [req('tool_used', 'Farklı araç kullan', 'Use different tools', 2, 'unique')],
+  );
+  if (day === 3) return task(
+    'routine_and_game',
+    'Oyun rutinini hazırla',
+    'Prepare a game routine',
+    'Bir oyun rutinini kaydet ve oyunu RELAXFPS üzerinden başlat.',
+    'Save a game routine and launch the game through RELAXFPS.',
+    [
+      req('routine_saved', 'Oyun rutinini kaydet', 'Save a game routine'),
+      req('game_started', 'Oyunu başlat', 'Launch the game'),
+    ],
+  );
+  if (day === 4) return task(
+    'read_announcements',
+    'İki duyuru oku',
+    'Read two announcements',
+    'Ana sayfadaki iki farklı duyuruyu ayrıntılarıyla incele.',
+    'Read the details of two different announcements.',
+    [req('announcement_read', 'Farklı duyuru oku', 'Read different announcements', 2, 'unique')],
+  );
+  if (day === 5) return task(
+    'social_profile',
+    'Sosyal hesabını hazırla',
+    'Prepare your social profile',
+    'İlk arkadaşını ekle veya profil adını tamamla.',
+    'Add your first friend or complete your profile name.',
+    [req('social_action', 'Arkadaş ekle veya profili tamamla', 'Add a friend or complete your profile', 1, 'derived_social')],
+  );
+  if (day === 6 && dailyTaskHasFriends(id)) return task(
+    'friends_active',
+    'Arkadaşlar bölümünde aktif kal',
+    'Stay active in Friends',
+    'Arkadaşlar sunucusunda bugün toplam 10 dakika aktif kal.',
+    'Stay active on the Friends server for 10 minutes today.',
+    [req('friends_active_seconds', 'Aktif süre', 'Active time', 600, 'derived_friends')],
+  );
+  if (day === 6) return task(
+    'start_game_fallback',
+    'Bir oyun başlat',
+    'Launch one game',
+    'Henüz arkadaşın olmadığı için bugünkü görev oyun başlatma olarak uyarlandı.',
+    'Because you have no friends yet, today’s task was adapted to launching a game.',
+    [req('game_started', 'Oyunu RELAXFPS üzerinden başlat', 'Launch a game through RELAXFPS')],
+  );
+  return task(
+    'weekly_combo',
+    'Haftalık final görevini tamamla',
+    'Complete the weekly final task',
+    'Bir boost, bir araç işlemi ve bir oyun başlangıcını aynı gün tamamla.',
+    'Complete a boost, a tool action and a game launch on the same day.',
+    [
+      req('boost_complete', 'Boost tamamla', 'Complete a boost'),
+      req('tool_used', 'Bir araç kullan', 'Use one tool', 1, 'unique'),
+      req('game_started', 'Bir oyun başlat', 'Launch a game'),
+    ],
+  );
+}
+
+function dailyTaskRequirementValue(id, record, requirement) {
+  if (requirement.kind === 'unique') {
+    const values = record.unique?.[requirement.key];
+    return values && typeof values === 'object' ? Object.keys(values).length : 0;
+  }
+  if (requirement.kind === 'derived_friends') {
+    return Math.max(0, Math.round(Number(friendUsageSnapshot(id, record.timezoneOffsetMinutes).usedSeconds || 0)));
+  }
+  if (requirement.kind === 'derived_social') {
+    const profileName = String(state.profiles?.[normalizeId(id)]?.name || '').trim();
+    const profileComplete = profileName && profileName !== 'Relax Friend' && profileName !== 'RelaxFPS User';
+    return profileComplete || dailyTaskHasFriends(id) || Number(record.progress?.social_action || 0) > 0 ? 1 : 0;
+  }
+  return Math.max(0, Math.round(Number(record.progress?.[requirement.key] || 0)));
+}
+
+function dailyTaskRequirementsSnapshot(id, record, definition) {
+  return definition.requirements.map((requirement) => ({
+    key: requirement.key,
+    label: requirement.label,
+    labelEn: requirement.labelEn || requirement.label,
+    target: requirement.target,
+    current: Math.min(requirement.target, dailyTaskRequirementValue(id, record, requirement)),
+    complete: dailyTaskRequirementValue(id, record, requirement) >= requirement.target,
+    unit: requirement.kind === 'derived_friends' ? 'seconds' : 'count',
+  }));
+}
+
+function dailyTaskSnapshot(id, timezoneOffsetMinutes = 0, extra = {}) {
+  const clean = normalizeId(id);
+  const record = dailyTaskRecord(clean, timezoneOffsetMinutes);
+  const definition = dailyTaskDefinition(clean, record);
+  const requirements = dailyTaskRequirementsSnapshot(clean, record, definition);
+  const currentDay = dailyTaskCurrentSeriesDay(record);
+  const completedDaysInCycle = record.completedToday ? currentDay : Math.max(0, currentDay - 1);
+  return {
+    state: {
+      id: clean,
+      dayKey: record.currentDayKey,
+      timezoneOffsetMinutes: record.timezoneOffsetMinutes,
+      streakDays: record.streakDays,
+      completedTotal: record.completedTotal,
+      completedToday: record.completedToday,
+      completedAt: record.completedAt || '',
+      currentDay,
+      cycle: dailyTaskCycleNumber(record),
+      completedDaysInCycle,
+      task: {
+        id: definition.id,
+        title: definition.title,
+        titleEn: definition.titleEn || definition.title,
+        description: definition.description,
+        descriptionEn: definition.descriptionEn || definition.description,
+        requirements,
+      },
+      nextReward: dailyTaskNextRewardPreview(record),
+      rewardSchedule: [500, 1000, 2000, 4000],
+      achievementReward: 5000,
+      history: record.history.slice().reverse().slice(0, 28),
+      serverTime: new Date().toISOString(),
+    },
+    ...extra,
+  };
+}
+
+async function dailyTaskFinalizeIfReady(id, timezoneOffsetMinutes = 0) {
+  const clean = normalizeId(id);
+  const record = dailyTaskRecord(clean, timezoneOffsetMinutes);
+  if (record.completedToday) return dailyTaskSnapshot(clean, timezoneOffsetMinutes, { completedNow: false });
+  const definition = dailyTaskDefinition(clean, record);
+  const requirements = dailyTaskRequirementsSnapshot(clean, record, definition);
+  if (!requirements.every((item) => item.complete)) {
+    return dailyTaskSnapshot(clean, timezoneOffsetMinutes, { completedNow: false });
+  }
+
+  const streakAfter = record.streakDays + 1;
+  const reward = dailyTaskRewardForCompletion(streakAfter);
+  let transaction = null;
+  if (reward.total > 0) {
+    const rewardRequestId = `daily-task:${clean}:${record.currentDayKey}:${streakAfter}`;
+    transaction = walletFindTransaction(clean, rewardRequestId);
+    if (!transaction) {
+      transaction = await walletCommitDelta({
+        id: clean,
+        delta: reward.total,
+        type: 'TASK_REWARD',
+        action: reward.achievement > 0 ? 'daily_task_28_day' : 'daily_task_weekly',
+        requestId: rewardRequestId,
+        source: 'daily_tasks',
+        metadata: {
+          dayKey: record.currentDayKey,
+          streakDays: streakAfter,
+          cycle: reward.cycle,
+          weeklyReward: reward.weekly,
+          achievementReward: reward.achievement,
+          taskId: definition.id,
+        },
+      });
+    }
+  }
+
+  record.streakDays = streakAfter;
+  record.completedTotal += 1;
+  record.completedToday = true;
+  record.completedAt = new Date().toISOString();
+  record.lastCompletedDayKey = record.currentDayKey;
+  record.updatedAt = record.completedAt;
+  record.history.push({
+    dayKey: record.currentDayKey,
+    day: definition.day,
+    cycle: definition.cycle,
+    taskId: definition.id,
+    title: definition.title,
+    reward: reward.total,
+    completedAt: record.completedAt,
+  });
+  record.history = record.history.slice(-DAILY_TASK_HISTORY_LIMIT);
+  await saveStateDurable();
+
+  if (transaction) {
+    sendTo(clean, {
+      type: 'wallet_changed',
+      wallet: walletPublicSnapshot(clean),
+      reason: 'daily_task_reward',
+      serverTime: new Date().toISOString(),
+    });
+  }
+  adminAudit('daily_task_completed', {
+    id: clean,
+    dayKey: record.currentDayKey,
+    streakDays: record.streakDays,
+    taskId: definition.id,
+    reward: reward.total,
+  });
+  return dailyTaskSnapshot(clean, timezoneOffsetMinutes, {
+    completedNow: true,
+    reward,
+    transaction: transaction ? {
+      id: transaction.id,
+      amount: transaction.amount,
+      balanceAfter: transaction.balanceAfter,
+      createdAt: transaction.createdAt,
+    } : null,
+    wallet: walletPublicSnapshot(clean),
+  });
+}
+
+async function dailyTaskRecordEvent(id, event, eventId, metadata = {}, timezoneOffsetMinutes = 0) {
+  const clean = normalizeId(id);
+  const record = dailyTaskRecord(clean, timezoneOffsetMinutes);
+  const cleanEvent = String(event || '').trim().toLowerCase().replace(/[^a-z0-9_:-]/g, '').slice(0, 60);
+  const cleanEventId = String(eventId || '').trim().slice(0, 160);
+  const allowed = new Set(['boost_complete', 'tool_used', 'routine_saved', 'game_started', 'announcement_read', 'friend_added', 'profile_completed']);
+  if (!allowed.has(cleanEvent) || cleanEventId.length < 8) {
+    throw Object.assign(new Error('Geçersiz günlük görev olayı.'), { code: 'invalid_task_event' });
+  }
+  if (record.completedToday) return dailyTaskSnapshot(clean, timezoneOffsetMinutes, { duplicate: false, ignored: true });
+  if (record.eventIds.includes(cleanEventId)) return dailyTaskSnapshot(clean, timezoneOffsetMinutes, { duplicate: true });
+
+  record.eventIds.push(cleanEventId);
+  record.eventIds = record.eventIds.slice(-DAILY_TASK_EVENT_LIMIT);
+  const definition = dailyTaskDefinition(clean, record);
+  const matching = definition.requirements.filter((requirement) => {
+    if (requirement.key === cleanEvent) return true;
+    if (requirement.key === 'social_action' && (cleanEvent === 'friend_added' || cleanEvent === 'profile_completed')) return true;
+    return false;
+  });
+
+  for (const requirement of matching) {
+    if (requirement.kind === 'unique') {
+      const uniqueValue = String(metadata.uniqueValue || metadata.toolId || metadata.announcementId || metadata.packageName || cleanEventId)
+        .trim().toLowerCase().slice(0, 160);
+      record.unique[requirement.key] = record.unique[requirement.key] && typeof record.unique[requirement.key] === 'object'
+        ? record.unique[requirement.key]
+        : {};
+      if (uniqueValue) record.unique[requirement.key][uniqueValue] = new Date().toISOString();
+    } else if (requirement.kind !== 'derived_friends' && requirement.kind !== 'derived_social') {
+      record.progress[requirement.key] = Math.min(
+        requirement.target,
+        Math.max(0, Math.round(Number(record.progress[requirement.key] || 0))) + 1,
+      );
+    } else if (requirement.key === 'social_action') {
+      record.progress.social_action = 1;
+    }
+  }
+  record.updatedAt = new Date().toISOString();
+  saveStateSoon();
+  return dailyTaskFinalizeIfReady(clean, timezoneOffsetMinutes);
 }
 
 function benchmarkComparison(model, totalScore) {
@@ -4999,6 +5569,56 @@ wss.on('connection', (socket, request) => {
         ...communityInsights(manufacturer, model),
         serverTime: new Date().toISOString(),
       });
+      return;
+    }
+
+
+    if (type === 'daily_task_state') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'daily_task_state');
+      if (!wallet) return;
+      const rate = walletRateLimit(`daily-task-state:${socketIp}:${id}`, 60, 60 * 1000, 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'daily_task_state', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla görev durumu isteği.' });
+        return;
+      }
+      try {
+        const result = await withDailyTaskMutation(
+          id,
+          () => dailyTaskFinalizeIfReady(id, data.timezoneOffsetMinutes),
+        );
+        send(socket, { type: 'daily_task_state', ok: true, requestId, ...result, serverTime: new Date().toISOString() });
+      } catch (error) {
+        send(socket, { type: 'daily_task_state', ok: false, requestId, code: error.code || 'daily_task_state_failed', message: error.message, ...dailyTaskSnapshot(id, data.timezoneOffsetMinutes) });
+      }
+      return;
+    }
+
+    if (type === 'daily_task_event') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'daily_task_event');
+      if (!wallet) return;
+      const rate = walletRateLimit(`daily-task-event:${socketIp}:${id}`, 90, 10 * 60 * 1000, 10 * 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'daily_task_event', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Görev olayları çok hızlı gönderildi.' });
+        return;
+      }
+      try {
+        const result = await withDailyTaskMutation(
+          id,
+          () => dailyTaskRecordEvent(
+            id,
+            data.event,
+            data.eventId,
+            data.metadata && typeof data.metadata === 'object' ? data.metadata : {},
+            data.timezoneOffsetMinutes,
+          ),
+        );
+        send(socket, { type: 'daily_task_event', ok: true, requestId, ...result, serverTime: new Date().toISOString() });
+      } catch (error) {
+        walletSecurityEvent('daily_task_event_rejected', { id, event: String(data.event || '').slice(0, 60), code: error.code || 'error' }, 'warning');
+        send(socket, { type: 'daily_task_event', ok: false, requestId, code: error.code || 'daily_task_event_failed', message: error.message, ...dailyTaskSnapshot(id, data.timezoneOffsetMinutes) });
+      }
       return;
     }
 
@@ -6417,6 +7037,32 @@ setInterval(() => {
   for (const id of activeFriendUsage.keys()) {
     const snapshot = friendUsageSnapshot(id);
     sendTo(id, { type: 'friend_usage', ...snapshot });
+    if (state.dailyTasks?.[id] && walletRecord(id)) {
+      withDailyTaskMutation(id, async () => {
+        const record = dailyTaskRecord(id, snapshot.timezoneOffsetMinutes);
+        const definition = dailyTaskDefinition(id, record);
+        const usesFriendTime = definition.requirements.some(
+          (requirement) => requirement.kind === 'derived_friends',
+        );
+        if (!usesFriendTime || record.completedToday) return null;
+        return dailyTaskFinalizeIfReady(id, snapshot.timezoneOffsetMinutes);
+      }).then((result) => {
+        if (result?.completedNow) {
+          sendTo(id, {
+            type: 'daily_task_update',
+            ok: true,
+            ...result,
+            serverTime: new Date().toISOString(),
+          });
+        }
+      }).catch((error) => {
+        walletSecurityEvent(
+          'daily_task_friend_time_finalize_failed',
+          { id, code: error.code || 'error' },
+          'warning',
+        );
+      });
+    }
     const paymentOverdue = !snapshot.premium
       && Number(snapshot.remainingSeconds || 0) <= 0
       && Number(snapshot.paidRemainingSeconds || 0) <= 0
@@ -6467,7 +7113,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.8.0-rfx-economy running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.9.0-daily-tasks running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
