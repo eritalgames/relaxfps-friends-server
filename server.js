@@ -342,6 +342,7 @@ const state = {
   flashOffers: {}, // RelaxFPS ID -> persistent 3-day flash offer schedule
   cloudBackups: {}, // RelaxFPS ID -> {keyHash,backup,createdAt,updatedAt,sizeBytes,version}
   communitySignals: {}, // RelaxFPS ID -> anonymized aggregate device/session signal
+  deviceIdentityMap: {}, // stable device-key hash -> current RelaxFPS ID mapping
   wallets: {}, // RelaxFPS ID -> server-authoritative RFX wallet
   walletTransactions: [], // append-only, HMAC chained token ledger
   walletRequestIndex: {}, // userId:requestId -> transactionId, prevents duplicate spending
@@ -399,6 +400,7 @@ function applyLoadedState(parsed) {
   state.flashOffers = state.flashOffers || {};
   state.cloudBackups = state.cloudBackups || {};
   state.communitySignals = state.communitySignals || {};
+  state.deviceIdentityMap = state.deviceIdentityMap && typeof state.deviceIdentityMap === 'object' ? state.deviceIdentityMap : {};
   state.wallets = state.wallets && typeof state.wallets === 'object' ? state.wallets : {};
   state.walletTransactions = Array.isArray(state.walletTransactions) ? state.walletTransactions : [];
   state.walletRequestIndex = state.walletRequestIndex && typeof state.walletRequestIndex === 'object' ? state.walletRequestIndex : {};
@@ -940,7 +942,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.9.0-daily-tasks',
+      version: '6.9.1-device-identity-reset',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -1100,6 +1102,54 @@ function normalizeId(value) {
 
 function validId(id) {
   return id.startsWith('RFX-') && id.length >= 8;
+}
+
+function normalizeDeviceIdentityKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-f0-9]/g, '').slice(0, 128);
+}
+
+function validDeviceIdentityKey(value) {
+  const clean = normalizeDeviceIdentityKey(value);
+  return clean.length >= 32 && clean.length <= 128;
+}
+
+function deviceIdentityHash(value) {
+  const clean = normalizeDeviceIdentityKey(value);
+  if (!validDeviceIdentityKey(clean)) return '';
+  return crypto.createHash('sha256')
+    .update(`RELAXFPS:DEVICE-IDENTITY:${clean}`, 'utf8')
+    .digest('hex');
+}
+
+function deviceIdentityMappedIds() {
+  return new Set(Object.values(state.deviceIdentityMap || {})
+    .map((entry) => normalizeId(entry?.currentId))
+    .filter(validId));
+}
+
+function identityIdExists(id, mappedIds = null) {
+  const clean = normalizeId(id);
+  const mapped = mappedIds || deviceIdentityMappedIds();
+  return mapped.has(clean)
+    || !!state.profiles?.[clean]
+    || !!state.wallets?.[clean]
+    || !!state.friendships?.[clean]
+    || !!state.premiumUsers?.[clean]
+    || !!state.bannedUsers?.[clean]
+    || !!state.dailyWheel?.[clean]
+    || !!state.dailyTasks?.[clean]
+    || !!state.cloudBackups?.[clean];
+}
+
+function generateFreshRelaxId() {
+  const mapped = deviceIdentityMappedIds();
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const first = crypto.randomInt(0, 10000).toString().padStart(4, '0');
+    const second = crypto.randomInt(0, 10000).toString().padStart(4, '0');
+    const id = `RFX-${first}-${second}`;
+    if (!identityIdExists(id, mapped)) return id;
+  }
+  throw Object.assign(new Error('Yeni RelaxFPS ID oluşturulamadı.'), { code: 'identity_generation_failed' });
 }
 
 function normalizeRecoveryKey(value) {
@@ -4795,6 +4845,127 @@ wss.on('connection', (socket, request) => {
     const type = String(data.type || '');
     const requestId = String(data.requestId || '');
 
+    if (type === 'identity_resolve') {
+      const deviceKey = normalizeDeviceIdentityKey(data.deviceKey);
+      const suggestedId = normalizeId(data.suggestedId);
+      if (!validDeviceIdentityKey(deviceKey) || !validId(suggestedId)) {
+        send(socket, {
+          type: 'identity_resolve', ok: false, requestId,
+          code: 'invalid_identity_request',
+          message: 'Geçerli cihaz anahtarı ve RelaxFPS ID gerekli.',
+        });
+        return;
+      }
+      const rate = walletRateLimit(`identity-resolve:${socketIp}`, 60, 60 * 60 * 1000, 10 * 60 * 1000);
+      if (!rate.ok) {
+        send(socket, {
+          type: 'identity_resolve', ok: false, requestId,
+          code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds,
+          message: 'Çok fazla kimlik çözümleme isteği.',
+        });
+        return;
+      }
+      const hash = deviceIdentityHash(deviceKey);
+      const existing = state.deviceIdentityMap?.[hash];
+      const current = validId(normalizeId(existing?.currentId))
+        ? normalizeId(existing.currentId)
+        : suggestedId;
+      state.deviceIdentityMap = state.deviceIdentityMap || {};
+      if (!existing || !validId(normalizeId(existing.currentId))) {
+        const created = {
+          currentId: current,
+          firstId: suggestedId,
+          generation: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        state.deviceIdentityMap[hash] = created;
+        if (!await saveStateDurable()) {
+          delete state.deviceIdentityMap[hash];
+          send(socket, {
+            type: 'identity_resolve', ok: false, requestId,
+            code: 'identity_persistence_failed',
+            message: 'Cihaz kimliği kalıcı veritabanına kaydedilemedi.',
+          });
+          return;
+        }
+      }
+      send(socket, {
+        type: 'identity_resolve', ok: true, requestId,
+        id: current,
+        generation: Math.max(0, Math.round(Number(state.deviceIdentityMap[hash]?.generation || 0))),
+        serverTime: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === 'identity_replace') {
+      const oldId = normalizeId(currentId || data.currentId || data.id);
+      const deviceKey = normalizeDeviceIdentityKey(data.deviceKey);
+      if (!validId(oldId) || currentId !== oldId || !validDeviceIdentityKey(deviceKey)) {
+        send(socket, {
+          type: 'identity_replace', ok: false, requestId,
+          code: 'identity_required',
+          message: 'Önce mevcut RelaxFPS ID ile sunucuya bağlan.',
+        });
+        return;
+      }
+      const hash = deviceIdentityHash(deviceKey);
+      const record = state.deviceIdentityMap?.[hash];
+      if (!record || normalizeId(record.currentId) !== oldId) {
+        send(socket, {
+          type: 'identity_replace', ok: false, requestId,
+          code: 'device_identity_mismatch',
+          message: 'Bu cihazın mevcut hesap eşlemesi doğrulanamadı.',
+        });
+        return;
+      }
+      const rate = walletRateLimit(`identity-replace:${hash}`, 3, 24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000);
+      if (!rate.ok) {
+        send(socket, {
+          type: 'identity_replace', ok: false, requestId,
+          code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds,
+          message: 'Bu cihazda kısa sürede çok fazla yeni hesap oluşturuldu.',
+        });
+        return;
+      }
+      try {
+        const newId = generateFreshRelaxId();
+        const before = { ...record };
+        state.deviceIdentityMap[hash] = {
+          ...record,
+          currentId: newId,
+          generation: Math.max(0, Math.round(Number(record.generation || 0))) + 1,
+          updatedAt: new Date().toISOString(),
+          previousId: oldId,
+        };
+        if (!await saveStateDurable()) {
+          state.deviceIdentityMap[hash] = before;
+          throw Object.assign(new Error('Yeni kimlik kalıcı veritabanına kaydedilemedi.'), { code: 'identity_persistence_failed' });
+        }
+        walletSecurityEvent('device_identity_replaced', {
+          oldId,
+          newId,
+          generation: state.deviceIdentityMap[hash].generation,
+        }, 'info');
+        send(socket, {
+          type: 'identity_replace', ok: true, requestId,
+          oldId, newId,
+          generation: state.deviceIdentityMap[hash].generation,
+          oldAccountDeleted: false,
+          message: 'Eski hesap sunucuda korundu; bu cihaz için yeni RelaxFPS ID oluşturuldu.',
+          serverTime: new Date().toISOString(),
+        });
+      } catch (error) {
+        send(socket, {
+          type: 'identity_replace', ok: false, requestId,
+          code: error.code || 'identity_replace_failed',
+          message: error.message || 'Yeni RelaxFPS ID oluşturulamadı.',
+        });
+      }
+      return;
+    }
+
     if (type === 'wallet_integrity_challenge') {
       const id = normalizeId(currentId || data.id);
       const action = walletActionKey(data.action);
@@ -7113,7 +7284,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.9.0-daily-tasks running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.9.1-device-identity-reset running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');

@@ -1,6 +1,6 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "6.9.0",
+  "version": "6.9.1",
   "description": "RELAXFPS backend with RFX economy, server-authoritative daily tasks, secure wallet, ad verification, Friends minutes, Google Play verification, Play Integrity, and Supabase persistence",
   "main": "server.js",
   "scripts": {
