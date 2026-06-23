@@ -914,7 +914,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.7.1-rfx-ssv-verify',
+      version: '6.7.2-rfx-ssv-verify-v2',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -1855,6 +1855,28 @@ async function processAdmobSsvCallback(rawQuery, ip = 'unknown') {
   const rewardItem = String(params.get('reward_item') || '').slice(0, 80);
   const callbackRewardAmount = Math.max(0, Math.round(Number(params.get('reward_amount') || 0)));
 
+  // AdMob panelindeki "Geri çağırma URL'sini doğrula" aracı gerçek bir
+  // reklam ödülü yerine Google tarafından imzalanmış sentetik test değerleri
+  // gönderebilir. user_id ve custom_data yoksa, imza doğrulandıktan sonra bu
+  // çağrı yalnız URL doğrulama probu kabul edilir. Hiçbir cüzdana ödül yazılmaz.
+  // Gerçek reklam kuralları (transaction/ad unit/timestamp) bu prob için
+  // uygulanmaz; gerçek callback'lerde aşağıda eksiksiz uygulanmaya devam eder.
+  const validationOnly = userId.length === 0 && customData.length === 0;
+  if (validationOnly) {
+    walletSecurityEvent('admob_ssv_validation_probe', {
+      ip,
+      transactionId: transactionId.slice(0, 180),
+      adUnit: normalizedAdUnit(adUnit),
+      rewardItem,
+      callbackRewardAmount,
+      timestampMs,
+    }, 'info');
+    return {
+      statusCode: 200,
+      payload: { ok: true, validationOnly: true },
+    };
+  }
+
   if (!/^[A-Za-z0-9._:-]{8,180}$/.test(transactionId)) {
     throw Object.assign(new Error('Geçersiz AdMob transaction_id.'), { code: 'invalid_transaction_id' });
   }
@@ -1863,24 +1885,6 @@ async function processAdmobSsvCallback(rawQuery, ip = 'unknown') {
   }
   if (!timestampMs || Math.abs(Date.now() - timestampMs) > ADMOB_CALLBACK_TOLERANCE_MS) {
     throw Object.assign(new Error('SSV zaman damgası kabul edilen aralığın dışında.'), { code: 'stale_callback' });
-  }
-
-  // AdMob panelindeki "Geri çağırma URL'sini doğrula" aracı user_id ve
-  // custom_data alanları boş bırakıldığında imzalı bir test çağrısı gönderir.
-  // Bu çağrı yalnız URL/imza doğrulaması içindir; hiçbir cüzdana ödül yazılmaz.
-  const validationOnly = userId.length === 0 && customData.length === 0;
-  if (validationOnly) {
-    walletSecurityEvent('admob_ssv_validation_probe', {
-      ip,
-      transactionId,
-      adUnit: normalizedAdUnit(adUnit),
-      rewardItem,
-      callbackRewardAmount,
-    }, 'info');
-    return {
-      statusCode: 200,
-      payload: { ok: true, validationOnly: true },
-    };
   }
 
   if (!validId(userId)) {
