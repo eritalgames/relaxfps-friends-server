@@ -3574,11 +3574,21 @@ function currentSocketIdentityMatches(socket, id) {
   return walletSocketIdentities.get(socket) === normalizeId(id);
 }
 
+function isPublicHttpUrl(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return (url.protocol === 'http:' || url.protocol === 'https:') && !!url.hostname;
+  } catch (_) {
+    return false;
+  }
+}
+
 function publicAnnouncements() {
   const now = Date.now();
   return (state.announcements || [])
     .filter((item) => {
       if (!item || item.active === false) return false;
+      if (!String(item.sourceName || '').trim() || !isPublicHttpUrl(item.link)) return false;
       if (!item.expiresAt) return true;
       const expires = Date.parse(item.expiresAt);
       return !Number.isFinite(expires) || expires > now;
@@ -3591,10 +3601,11 @@ function publicAnnouncements() {
       if (priorityDiff !== 0) return priorityDiff;
       return (Number(a.order || 0) - Number(b.order || 0)) || String(b.time || '').localeCompare(String(a.time || ''));
     })
-    .slice(0, 60)
+    .slice(0, 8)
     .map((item) => ({
       id: item.id,
       title: item.title,
+      summary: item.summary || '',
       body: item.body,
       category: item.category || 'Duyuru',
       sourceName: item.sourceName || 'RELAXFPS',
@@ -3610,6 +3621,7 @@ function publicAnnouncements() {
       expiresAt: item.expiresAt || '',
       order: Number(item.order || 0),
       time: item.time,
+      updatedAt: item.updatedAt || item.time,
     }));
 }
 
@@ -5345,11 +5357,12 @@ wss.on('connection', (socket, request) => {
       const id = incomingId || `ann-${Date.now()}-${Math.floor(Math.random() * 99999)}`;
       const item = {
         id,
-        title: String(data.title || '').slice(0, 160),
-        body: String(data.body || '').slice(0, 9000),
-        category: String(data.category || 'Duyuru').slice(0, 60),
-        sourceName: String(data.sourceName || 'RELAXFPS').slice(0, 80),
-        link: String(data.link || '').slice(0, 600),
+        title: String(data.title || '').trim().slice(0, 160),
+        summary: String(data.summary || '').trim().slice(0, 500),
+        body: String(data.body || '').trim().slice(0, 9000),
+        category: String(data.category || 'Duyuru').trim().slice(0, 60),
+        sourceName: String(data.sourceName || '').trim().slice(0, 80),
+        link: String(data.link || '').trim().slice(0, 600),
         buttonLabel: String(data.buttonLabel || '').slice(0, 80),
         buttonAction: String(data.buttonAction || '').slice(0, 80),
         panelId: String(data.panelId || '').slice(0, 120),
@@ -5363,7 +5376,12 @@ wss.on('connection', (socket, request) => {
         time: incomingId ? ((state.announcements || []).find((x) => x.id === incomingId)?.time || new Date().toISOString()) : new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      if (!item.title || !item.body) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Announcement title/body required' });
+      if (!item.title || !item.summary || !item.body) {
+        return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Duyuru başlığı, özeti ve içeriği zorunludur.' });
+      }
+      if (!item.sourceName || !isPublicHttpUrl(item.link)) {
+        return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Kaynak adı ve geçerli http/https kaynak bağlantısı zorunludur.' });
+      }
       state.announcements = state.announcements || [];
       const index = state.announcements.findIndex((x) => x.id === id);
       if (index >= 0) state.announcements[index] = item; else state.announcements.push(item);
@@ -5705,22 +5723,102 @@ wss.on('connection', (socket, request) => {
       return;
     }
 
+    if (type === 'feedback_list') {
+      const from = normalizeId(currentId);
+      if (!validId(from) || !currentSocketIdentityMatches(socket, from)) {
+        send(socket, { type: 'feedback_list', ok: false, requestId, message: 'Registered RelaxFPS ID required.' });
+        return;
+      }
+      const items = (state.feedback || [])
+        .filter((item) => normalizeId(item.from) === from)
+        .slice()
+        .reverse()
+        .slice(0, 50)
+        .map((item) => ({
+          id: item.id,
+          email: item.email || '',
+          title: item.title || '',
+          category: item.category || 'technical',
+          body: item.body || '',
+          attachmentName: item.attachmentName || '',
+          status: item.status || 'new',
+          reply: item.reply || '',
+          priority: item.priority || 'normal',
+          time: item.time || '',
+          updatedAt: item.updatedAt || item.time || '',
+        }));
+      send(socket, { type: 'feedback_list', ok: true, requestId, items });
+      return;
+    }
+
     if (type === 'feedback_submit') {
-      const from = normalizeId(data.from || currentId);
+      const from = normalizeId(currentId);
+      if (!validId(from) || !currentSocketIdentityMatches(socket, from)) {
+        send(socket, { type: 'feedback_saved', ok: false, requestId, message: 'Registered RelaxFPS ID required.' });
+        return;
+      }
+
+      const categories = new Set(['technical', 'payment', 'server', 'other']);
+      const category = categories.has(String(data.category || '').trim()) ? String(data.category).trim() : 'technical';
+      const email = String(data.email || '').trim().slice(0, 160);
+      const title = String(data.title || '').trim().slice(0, 120);
+      const body = String(data.body || '').trim().slice(0, 4000);
+      const attachmentBase64 = String(data.attachmentBase64 || '').trim();
+      const attachmentName = String(data.attachmentName || '').trim().slice(0, 140);
+      const attachmentMime = String(data.attachmentMime || '').trim().slice(0, 80);
+      const hasAttachment = attachmentBase64.length > 0;
+
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || title.length < 3 || body.length < 10) {
+        send(socket, { type: 'feedback_saved', ok: false, requestId, message: 'Valid email, title and detailed message are required.' });
+        return;
+      }
+      if (hasAttachment && (attachmentBase64.length > 500000 || !/^image\/(jpeg|png|webp)$/i.test(attachmentMime))) {
+        send(socket, { type: 'feedback_saved', ok: false, requestId, message: 'Attachment must be a JPEG, PNG or WEBP image under the size limit.' });
+        return;
+      }
+
       const item = {
         id: `fb-${Date.now()}-${Math.floor(Math.random() * 99999)}`,
-        from: validId(from) ? from : 'UNKNOWN',
-        title: String(data.title || 'Feedback').slice(0, 120),
-        body: String(data.body || '').slice(0, 4000),
+        from,
+        email,
+        title,
+        category,
+        body,
+        attachmentBase64: hasAttachment ? attachmentBase64 : '',
+        attachmentName: hasAttachment ? (attachmentName || 'support-image') : '',
+        attachmentMime: hasAttachment ? attachmentMime : '',
+        priority: data.premium === true ? 'premium' : 'normal',
         status: 'new',
         reply: '',
         time: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       };
       state.feedback = state.feedback || [];
       state.feedback.push(item);
       if (state.feedback.length > 500) state.feedback = state.feedback.slice(-500);
+      const attachmentCutoff = Math.max(0, state.feedback.length - 12);
+      for (let index = 0; index < attachmentCutoff; index += 1) {
+        if (state.feedback[index]?.attachmentBase64) state.feedback[index].attachmentBase64 = '';
+      }
       saveStateSoon();
-      send(socket, { type: 'feedback_saved', ok: true, id: item.id, requestId });
+      send(socket, {
+        type: 'feedback_saved',
+        ok: true,
+        id: item.id,
+        requestId,
+        item: {
+          id: item.id,
+          email: item.email,
+          title: item.title,
+          category: item.category,
+          body: item.body,
+          attachmentName: item.attachmentName,
+          status: item.status,
+          reply: item.reply,
+          priority: item.priority,
+          time: item.time,
+        },
+      });
       return;
     }
 

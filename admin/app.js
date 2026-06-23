@@ -343,9 +343,10 @@ function renderAnnouncements() {
           <input id="annId" type="hidden">
           ${field('annTitle','Başlık','text','',true,'full')}
           ${field('annCategory','Kategori','text','Duyuru')}
-          ${field('annSource','Kaynak adı','text','RELAXFPS')}
-          ${area('annBody','İçerik',true,'full')}
-          ${field('annLink','Kaynak bağlantısı','url','','false','full')}
+          ${field('annSource','Kaynak adı','text','',true)}
+          ${area('annSummary','Kısa özet',true,'full')}
+          ${area('annBody','Tam içerik',true,'full')}
+          ${field('annLink','Kaynak bağlantısı','url','',true,'full')}
           ${field('annButton','Buton yazısı')}${field('annAction','Buton aksiyonu')}
           ${field('annPanel','Özel panel ID')}${field('annOrder','Sıra','number','0')}
           ${field('annPriority','Öncelik 0-100','number','0')}${field('annExpires','Bitiş tarihi','datetime-local')}
@@ -369,13 +370,14 @@ function renderAnnouncements() {
   $('#announcementList').addEventListener('click', handleAnnouncementAction);
 }
 function announcementItem(item) {
-  return `<article class="list-item" data-id="${escapeHtml(item.id)}"><div class="list-item-head"><div><h4>${escapeHtml(item.title)}</h4><span class="badge ${item.active === false ? 'bad' : 'ok'}">${item.active === false ? 'PASİF' : 'AKTİF'}</span> ${item.pinned ? '<span class="badge warn">SABİT</span>' : ''}</div><span class="muted">${escapeHtml(fmtDate(item.updatedAt || item.time))}</span></div><p>${escapeHtml(item.body)}</p><div class="actions"><button data-action="edit">Düzenle</button><button data-action="delete" class="danger">Sil</button></div></article>`;
+  const sourceOk = item.sourceName && /^https?:\/\//i.test(item.link || '');
+  return `<article class="list-item" data-id="${escapeHtml(item.id)}"><div class="list-item-head"><div><h4>${escapeHtml(item.title)}</h4><span class="badge ${item.active === false ? 'bad' : 'ok'}">${item.active === false ? 'PASİF' : 'AKTİF'}</span> ${item.pinned ? '<span class="badge warn">SABİT</span>' : ''} <span class="badge ${sourceOk ? 'ok' : 'bad'}">${sourceOk ? 'KAYNAKLI' : 'KAYNAK EKSİK'}</span></div><span class="muted">${escapeHtml(fmtDate(item.updatedAt || item.time))}</span></div><p><strong>${escapeHtml(item.summary || '')}</strong></p><p>${escapeHtml(item.body)}</p><p class="muted">${escapeHtml(item.sourceName || '—')} • ${escapeHtml(item.link || '—')}</p><div class="actions"><button data-action="edit">Düzenle</button><button data-action="delete" class="danger">Sil</button></div></article>`;
 }
 async function saveAnnouncement(event) {
   event.preventDefault(); const button = event.submitter; setBusy(button, true);
   try {
     await request('admin_upsert_announcement', {
-      id: $('#annId').value.trim(), title: $('#annTitle').value.trim(), body: $('#annBody').value.trim(),
+      id: $('#annId').value.trim(), title: $('#annTitle').value.trim(), summary: $('#annSummary').value.trim(), body: $('#annBody').value.trim(),
       category: $('#annCategory').value.trim(), sourceName: $('#annSource').value.trim(), link: $('#annLink').value.trim(),
       buttonLabel: $('#annButton').value.trim(), buttonAction: $('#annAction').value.trim(), panelId: $('#annPanel').value.trim(),
       order: Number($('#annOrder').value || 0), priority: Number($('#annPriority').value || 0),
@@ -392,8 +394,8 @@ function handleAnnouncementAction(event) {
   else confirmAction('Duyuruyu sil', `“${item.title}” kalıcı olarak silinsin mi?`, async () => { await request('admin_delete_announcement', { id }); await refreshSnapshot(); toast('Duyuru silindi.'); });
 }
 function fillAnnouncement(item) {
-  $('#annId').value = item.id || ''; $('#annTitle').value = item.title || ''; $('#annBody').value = item.body || '';
-  $('#annCategory').value = item.category || 'Duyuru'; $('#annSource').value = item.sourceName || 'RELAXFPS'; $('#annLink').value = item.link || '';
+  $('#annId').value = item.id || ''; $('#annTitle').value = item.title || ''; $('#annSummary').value = item.summary || ''; $('#annBody').value = item.body || '';
+  $('#annCategory').value = item.category || 'Duyuru'; $('#annSource').value = item.sourceName || ''; $('#annLink').value = item.link || '';
   $('#annButton').value = item.buttonLabel || ''; $('#annAction').value = item.buttonAction || ''; $('#annPanel').value = item.panelId || '';
   $('#annOrder').value = item.order || 0; $('#annPriority').value = item.priority || 0; $('#annExpires').value = toLocalInput(item.expiresAt);
   $('#annActive').checked = item.active !== false; $('#annPinned').checked = item.pinned === true;
@@ -401,7 +403,7 @@ function fillAnnouncement(item) {
   const preview = $('#annImagePreview'); if (announcementImageBase64) { preview.src = `data:image/*;base64,${announcementImageBase64}`; preview.classList.remove('hidden'); } else preview.classList.add('hidden');
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
-function clearAnnouncementForm() { $('#announcementForm')?.reset(); $('#annId').value=''; $('#annCategory').value='Duyuru'; $('#annSource').value='RELAXFPS'; $('#annOrder').value='0'; $('#annPriority').value='0'; $('#annActive').checked=true; announcementImageBase64=''; announcementVideoBase64=''; $('#annImagePreview').classList.add('hidden'); }
+function clearAnnouncementForm() { $('#announcementForm')?.reset(); $('#annId').value=''; $('#annCategory').value='Duyuru'; $('#annSource').value=''; $('#annOrder').value='0'; $('#annPriority').value='0'; $('#annActive').checked=true; announcementImageBase64=''; announcementVideoBase64=''; $('#annImagePreview').classList.add('hidden'); }
 
 function renderPanels() {
   const items = snapshot.customPanels || [];
@@ -666,7 +668,11 @@ function renderFeedback() {
   pageContent.innerHTML = `<div class="section-head"><div><h3>Kullanıcı geri bildirimleri</h3><p>${items.length} kayıt</p></div></div><div id="feedbackList" class="list">${items.map(feedbackItem).join('')||'<div class="card empty">Geri bildirim yok.</div>'}</div>`;
   $('#feedbackList').addEventListener('click', async e=>{const b=e.target.closest('button[data-feedback]');if(!b)return;const id=b.dataset.feedback;const card=b.closest('[data-feedback-card]');try{await request('admin_update_feedback',{id,status:card.querySelector('select').value,reply:card.querySelector('textarea').value.trim()});await refreshSnapshot();toast('Geri bildirim güncellendi.');}catch(err){toast(err.message,true)}});
 }
-function feedbackItem(i){return `<article class="card" data-feedback-card="${escapeHtml(i.id)}"><div class="list-item-head"><div><h3>${escapeHtml(i.title||'Geri bildirim')}</h3><span class="badge code">${escapeHtml(i.from||'UNKNOWN')}</span></div><span class="muted">${escapeHtml(fmtDate(i.time))}</span></div><p class="muted">${escapeHtml(i.body||'')}</p><div class="form-grid"><label><span>Durum</span><select><option value="new" ${i.status==='new'?'selected':''}>Yeni</option><option value="reviewing" ${i.status==='reviewing'?'selected':''}>İnceleniyor</option><option value="resolved" ${i.status==='resolved'?'selected':''}>Çözüldü</option><option value="closed" ${i.status==='closed'?'selected':''}>Kapalı</option></select></label><label class="full"><span>Yanıt</span><textarea>${escapeHtml(i.reply||'')}</textarea></label><button class="primary full" data-feedback="${escapeHtml(i.id)}">Kaydet ve kullanıcıya gönder</button></div></article>`}
+function feedbackItem(i){
+  const categoryLabels={technical:'Teknik sorun',payment:'Ödeme sorunu',server:'Sunucu / bağlantı',other:'Diğer'};
+  const attachment=i.attachmentBase64?`<div style="margin:12px 0"><img class="image-preview" src="data:${escapeHtml(i.attachmentMime||'image/jpeg')};base64,${i.attachmentBase64}" alt="${escapeHtml(i.attachmentName||'Destek görseli')}"><p class="muted">${escapeHtml(i.attachmentName||'Görsel eki')}</p></div>`:'';
+  return `<article class="card" data-feedback-card="${escapeHtml(i.id)}"><div class="list-item-head"><div><h3>${escapeHtml(i.title||'Destek talebi')}</h3><span class="badge code">${escapeHtml(i.from||'UNKNOWN')}</span> <span class="badge ${i.priority==='premium'?'warn':'ok'}">${i.priority==='premium'?'ÖNCELİKLİ':'NORMAL'}</span> <span class="badge">${escapeHtml(categoryLabels[i.category]||'Teknik sorun')}</span></div><span class="muted">${escapeHtml(fmtDate(i.updatedAt||i.time))}</span></div><p class="muted">${escapeHtml(i.email||'E-posta yok')}</p><p>${escapeHtml(i.body||'')}</p>${attachment}<div class="form-grid"><label><span>Durum</span><select><option value="new" ${i.status==='new'?'selected':''}>Yeni</option><option value="reviewing" ${i.status==='reviewing'?'selected':''}>İnceleniyor</option><option value="resolved" ${i.status==='resolved'?'selected':''}>Çözüldü</option><option value="closed" ${i.status==='closed'?'selected':''}>Kapalı</option></select></label><label class="full"><span>Yanıt</span><textarea>${escapeHtml(i.reply||'')}</textarea></label><button class="primary full" data-feedback="${escapeHtml(i.id)}">Kaydet ve kullanıcıya gönder</button></div></article>`;
+}
 
 function renderSecurity() {
   const security = snapshot.adminSecurity || {};
