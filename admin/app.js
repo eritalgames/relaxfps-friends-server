@@ -33,7 +33,7 @@ const titles = {
   overview: ['YÖNETİM MERKEZİ', 'Genel Bakış'],
   content: ['YAYIN VE İÇERİK', 'İçerik Yönetimi'],
   users: ['KULLANICI MERKEZİ', 'Kullanıcılar'],
-  wallet: ['RFX TOKEN MERKEZİ', 'RFX Token'],
+  wallet: ['RFX TOKEN MERKEZİ', 'RFX'],
   'app-control': ['UZAKTAN YÖNETİM', 'Uygulama Kontrolü'],
   feedback: ['DESTEK MERKEZİ', 'Geri Bildirim'],
   security: ['SİSTEM VE GÜVENLİK', 'Güvenlik'],
@@ -472,7 +472,7 @@ function renderWallet() {
   pageContent.innerHTML = `
     <div class="grid stats-grid">
       ${statCard('Kayıtlı cüzdan', wallets.length, `${lockedCount} kilitli`, 'green')}
-      ${statCard('Dolaşımdaki token', fmtToken(totalBalance), settings.currencyName || 'RFX Token', 'blue')}
+      ${statCard('Dolaşımdaki RFX', fmtToken(totalBalance), settings.currencyName || 'RFX', 'blue')}
       ${statCard('İşlem defteri', transactions.length, `Son sıra: ${escapeHtml(integrity.sequence || 0)}`, 'orange')}
       ${statCard('Defter bütünlüğü', integrity.ok ? 'DOĞRULANDI' : 'DİKKAT', integrity.code || '—', integrity.ok ? 'green' : 'red')}
       ${statCard('Güvenlik incelemesi', pendingSecurityReviews.length, `${securityReviews.length} toplam kayıt`, pendingSecurityReviews.length ? 'red' : 'green')}
@@ -485,21 +485,21 @@ function renderWallet() {
       <section id="walletDetail" class="card">${selected ? walletDetail(selected) : '<div class="empty">Bir cüzdan seç.</div>'}</section>
     </div>
 
-    <div class="section-head"><div><h3>Token ekonomisi</h3><p>Hoş geldin ödülü, reklam ödülü ve sunucu fiyatları</p></div></div>
+    <div class="section-head"><div><h3>RFX ekonomisi</h3><p>Hoş geldin ödülü, sınırsız reklam ödülü ve işlem fiyatları</p></div></div>
     <form id="walletSettingsForm" class="card">
       <div class="form-grid">
-        <label class="check-row"><input id="walletEnabled" type="checkbox" ${settings.enabled !== false ? 'checked' : ''}> Token sistemi aktif</label>
-        <label class="check-row"><input id="walletPremiumUnlimited" type="checkbox" ${settings.premiumUnlimited !== false ? 'checked' : ''}> Premium sınırsız token</label>
-        ${fieldValue('walletCurrencyName','Para birimi adı',settings.currencyName || 'RFX Token')}
-        ${fieldValue('walletWelcomeBonus','Hoş geldin ödülü',settings.welcomeBonus ?? 500,'number')}
-        ${fieldValue('walletAdReward','Reklam ödülü',settings.adReward ?? 100,'number')}
-        ${fieldValue('walletDailyAdLimit','Günlük reklam sınırı',settings.dailyAdLimit ?? 3,'number')}
+        <label class="check-row"><input id="walletEnabled" type="checkbox" ${settings.enabled !== false ? 'checked' : ''}> RFX sistemi aktif</label>
+        <label class="check-row"><input id="walletPremiumUnlimited" type="checkbox" ${settings.premiumUnlimited !== false ? 'checked' : ''}> Premium sınırsız RFX</label>
+        ${fieldValue('walletCurrencyName','Para birimi adı',settings.currencyName || 'RFX')}
+        ${fieldValue('walletWelcomeBonus','Hoş geldin ödülü',settings.welcomeBonus ?? 250,'number')}
+        ${fieldValue('walletAdReward','Reklam ödülü',settings.adReward ?? 20,'number')}
+        ${fieldValue('walletDailyAdLimit','Günlük reklam sınırı (0 = sınırsız)',settings.dailyAdLimit ?? 0,'number')}
         <label class="full"><span>İşlem fiyatları (JSON)</span><textarea id="walletPrices" class="code" style="min-height:290px">${escapeHtml(JSON.stringify(settings.prices || {}, null, 2))}</textarea></label>
-        <div class="actions full"><button class="primary" type="submit">Token ayarlarını kaydet</button><button id="verifyWalletLedger" class="ghost" type="button">İşlem defterini doğrula</button></div>
+        <div class="actions full"><button class="primary" type="submit">RFX ayarlarını kaydet</button><button id="verifyWalletLedger" class="ghost" type="button">İşlem defterini doğrula</button></div>
       </div>
     </form>
 
-    <div class="section-head"><div><h3>Son token işlemleri</h3><p>Sunucu tarafından imzalanmış işlem özeti</p></div></div>
+    <div class="section-head"><div><h3>Son RFX işlemleri</h3><p>Sunucu tarafından imzalanmış işlem özeti</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Zaman</th><th>Kullanıcı</th><th>Tür</th><th>İşlem</th><th>Miktar</th><th>Son bakiye</th></tr></thead><tbody>${transactions.map(walletTransactionRow).join('') || '<tr><td colspan="6">Henüz işlem yok.</td></tr>'}</tbody></table></div>
 
     <div class="section-head"><div><h3>Play Integrity inceleme kuyruğu</h3><p>Riskli cihaz ve hesaplar yalnız yönetici kararıyla kalıcı olarak banlanır</p></div></div>
@@ -540,7 +540,7 @@ function renderWallet() {
         },
       });
       await refreshSnapshot();
-      toast('RFX Token ayarları kaydedildi.');
+      toast('RFX ayarları kaydedildi.');
     } catch (error) { toast(error.message, true); }
     finally { setBusy(button, false); }
   });
@@ -551,7 +551,7 @@ function renderWallet() {
     try {
       const result = await request('admin_wallet_verify_ledger');
       await refreshSnapshot();
-      toast(result.integrity?.ok ? 'Token işlem defteri doğrulandı.' : 'İşlem defteri doğrulanamadı.', !result.integrity?.ok);
+      toast(result.integrity?.ok ? 'RFX işlem defteri doğrulandı.' : 'İşlem defteri doğrulanamadı.', !result.integrity?.ok);
     } catch (error) { toast(error.message, true); }
     finally { setBusy(button, false); }
   });
@@ -591,12 +591,12 @@ function walletRow(wallet) {
 
 function walletDetail(wallet) {
   const userTransactions = (snapshot.walletTransactions || []).filter(item => item.userId === wallet.id).slice(0, 12);
-  return `<div class="section-head"><div><h3 class="code">${escapeHtml(wallet.id)}</h3><p>Sunucu esaslı RFX Token cüzdanı</p></div><span class="badge ${wallet.locked ? 'bad' : 'ok'}">${wallet.locked ? 'KİLİTLİ' : 'AKTİF'}</span></div>
+  return `<div class="section-head"><div><h3 class="code">${escapeHtml(wallet.id)}</h3><p>Sunucu esaslı RFX cüzdanı</p></div><span class="badge ${wallet.locked ? 'bad' : 'ok'}">${wallet.locked ? 'KİLİTLİ' : 'AKTİF'}</span></div>
     <div class="wallet-hero"><small>GÜNCEL BAKİYE</small><strong>◆ ${escapeHtml(fmtToken(wallet.balance))}</strong></div>
     <div class="list">${infoRow('Hoş geldin ödülü',wallet.welcomeGranted ? 'Verildi' : 'Verilmedi')}${infoRow('Oluşturulma',fmtDate(wallet.createdAt))}${infoRow('Son güncelleme',fmtDate(wallet.updatedAt))}${infoRow('Risk puanı',wallet.riskScore || 0)}${infoRow('Kilit bitişi',fmtDate(wallet.lockedUntil))}${infoRow('Kilit nedeni',wallet.lockReason || '—')}</div>
     <hr style="border-color:var(--line);border-width:1px 0 0;margin:20px 0">
     <div class="form-grid">
-      ${field('walletAdjustAmount','Token miktarı','number','Örn. 500 veya -100')}
+      ${field('walletAdjustAmount','RFX miktarı','number','Örn. 500 veya -100')}
       ${field('walletAdjustReason','İşlem nedeni','text','Destek düzeltmesi')}
       <button id="walletAdjust" class="primary full">Bakiyeyi güncelle</button>
       ${field('walletLockMinutes','Kilit süresi (dakika)','number','0 = süresiz')}

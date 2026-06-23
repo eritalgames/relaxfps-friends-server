@@ -14,7 +14,7 @@ const ADMIN_SESSION_SECRET = String(process.env.RELAXFPS_ADMIN_SESSION_SECRET ||
 const ADMIN_LOGIN_MAX_ATTEMPTS = Math.max(3, Math.min(Number(process.env.RELAXFPS_ADMIN_LOGIN_MAX_ATTEMPTS || 5), 20));
 const ADMIN_LOGIN_BLOCK_MINUTES = Math.max(1, Math.min(Number(process.env.RELAXFPS_ADMIN_LOGIN_BLOCK_MINUTES || 15), 1440));
 
-// RFX Token ledger security. Set RELAXFPS_WALLET_LEDGER_SECRET to a stable,
+// RFX ledger security. Set RELAXFPS_WALLET_LEDGER_SECRET to a stable,
 // high-entropy value in production. ADMIN_SESSION_SECRET is used only as a
 // compatibility fallback so existing deployments do not fail to boot.
 const WALLET_LEDGER_SECRET_SOURCE = String(
@@ -77,10 +77,11 @@ const GOOGLE_PLAY_VOIDED_SYNC_INTERVAL_MS = Math.max(
 );
 const GOOGLE_PLAY_MAX_PURCHASE_RECORDS = 50000;
 const GOOGLE_PLAY_TOKEN_PRODUCTS = Object.freeze({
-  relaxfps_rfx_500: { amount: 500, label: 'Başlangıç paketi' },
-  relaxfps_rfx_100000: { amount: 100000, label: 'Güç paketi' },
-  relaxfps_rfx_1000000: { amount: 1000000, label: 'Pro paket' },
-  relaxfps_rfx_10000000: { amount: 10000000, label: 'Mega paket' },
+  relaxfps_rfx_5000: { amount: 5000, label: 'Başlangıç paketi' },
+  relaxfps_rfx_25000: { amount: 25000, label: 'Klasik paket' },
+  relaxfps_rfx_40000: { amount: 40000, label: 'Pro paket' },
+  relaxfps_rfx_90000: { amount: 90000, label: 'Mega paket' },
+  relaxfps_rfx_350000: { amount: 350000, label: 'Ultra Mega paket' },
 });
 let googlePlayAccessTokenCache = { token: '', expiresAt: 0 };
 const googlePlayPurchaseLocks = new Map();
@@ -181,6 +182,7 @@ const activeFriendUsage = new Map(); // RelaxFPS ID -> {lastCommitMs, timezoneOf
 
 function defaultAppSettings() {
   return {
+    appSettingsVersion: 2,
     maintenanceMode: false,
     maintenanceMessage: '',
     maintenanceUntil: '',
@@ -202,7 +204,7 @@ function defaultAppSettings() {
     minimumVersion: '',
     updateMessage: '',
     playStoreUrl: '',
-    freeFriendMinutes: 15,
+    freeFriendMinutes: 20,
     premiumFriendMinutes: 60,
     appLockFailLimit: 3,
     appLockLockMinutes: 2,
@@ -214,17 +216,29 @@ function defaultAppSettings() {
 }
 
 function normalizeAppSettings(value) {
-  return { ...defaultAppSettings(), ...(value && typeof value === 'object' ? value : {}) };
+  const incoming = value && typeof value === 'object' ? value : {};
+  const migrateToV2 = Math.max(0, Math.round(Number(incoming.appSettingsVersion || 0))) < 2;
+  return {
+    ...defaultAppSettings(),
+    ...incoming,
+    appSettingsVersion: 2,
+    freeFriendMinutes: migrateToV2
+      ? 20
+      : Math.max(0, Math.min(1440, Math.round(Number(incoming.freeFriendMinutes ?? 20)))),
+  };
 }
 
 function defaultWalletSettings() {
   return {
+    economyVersion: 2,
     enabled: true,
-    currencyName: 'RFX Token',
-    welcomeBonus: 500,
+    currencyName: 'RFX',
+    welcomeBonus: 250,
     premiumUnlimited: true,
-    dailyAdLimit: 3,
-    adReward: 100,
+    // 0 means unlimited rewarded-ad sessions; abuse protection remains in SSV,
+    // request replay checks and the one-pending-session rule.
+    dailyAdLimit: 0,
+    adReward: 20,
     prices: {
       game_readiness: 10,
       device_health: 10,
@@ -253,10 +267,10 @@ function defaultWalletSettings() {
       thermal_pro: 75,
       latency_optimizer: 75,
       gfx_tool: 50,
-      server_10m: 50,
-      server_30m: 100,
-      server_2h: 250,
-      server_24h: 500,
+      friends_paid_minute: 10,
+      server_10m: 90,
+      server_20m: 170,
+      server_1h: 450,
       premium_tool_trial: 250,
     },
     updatedAt: '',
@@ -266,6 +280,8 @@ function defaultWalletSettings() {
 function normalizeWalletSettings(value) {
   const incoming = value && typeof value === 'object' ? value : {};
   const defaults = defaultWalletSettings();
+  const incomingVersion = Math.max(0, Math.round(Number(incoming.economyVersion || 0)));
+  const migrateToV2 = incomingVersion < 2;
   const incomingPrices = incoming.prices && typeof incoming.prices === 'object' ? incoming.prices : {};
   const prices = { ...defaults.prices };
   for (const [key, rawValue] of Object.entries(incomingPrices)) {
@@ -273,15 +289,22 @@ function normalizeWalletSettings(value) {
     const amount = Math.round(Number(rawValue || 0));
     if (cleanKey && Number.isFinite(amount) && amount >= 0 && amount <= 10000000) prices[cleanKey] = amount;
   }
+  if (migrateToV2) {
+    prices.friends_paid_minute = 10;
+    prices.server_10m = 90;
+    prices.server_20m = 170;
+    prices.server_1h = 450;
+  }
   return {
     ...defaults,
     ...incoming,
+    economyVersion: 2,
     enabled: incoming.enabled !== false,
-    currencyName: String(incoming.currencyName || defaults.currencyName).slice(0, 40),
-    welcomeBonus: Math.max(0, Math.min(Math.round(Number(incoming.welcomeBonus ?? defaults.welcomeBonus)), 1000000)),
+    currencyName: migrateToV2 ? 'RFX' : String(incoming.currencyName || defaults.currencyName).slice(0, 40),
+    welcomeBonus: migrateToV2 ? 250 : Math.max(0, Math.min(Math.round(Number(incoming.welcomeBonus ?? defaults.welcomeBonus)), 1000000)),
     premiumUnlimited: incoming.premiumUnlimited !== false,
-    dailyAdLimit: Math.max(0, Math.min(Math.round(Number(incoming.dailyAdLimit ?? defaults.dailyAdLimit)), 100)),
-    adReward: Math.max(0, Math.min(Math.round(Number(incoming.adReward ?? defaults.adReward)), 1000000)),
+    dailyAdLimit: migrateToV2 ? 0 : Math.max(0, Math.min(Math.round(Number(incoming.dailyAdLimit ?? defaults.dailyAdLimit)), 100000)),
+    adReward: migrateToV2 ? 20 : Math.max(0, Math.min(Math.round(Number(incoming.adReward ?? defaults.adReward)), 1000000)),
     prices,
     updatedAt: String(incoming.updatedAt || ''),
   };
@@ -317,7 +340,7 @@ const state = {
   flashOffers: {}, // RelaxFPS ID -> persistent 3-day flash offer schedule
   cloudBackups: {}, // RelaxFPS ID -> {keyHash,backup,createdAt,updatedAt,sizeBytes,version}
   communitySignals: {}, // RelaxFPS ID -> anonymized aggregate device/session signal
-  wallets: {}, // RelaxFPS ID -> server-authoritative RFX Token wallet
+  wallets: {}, // RelaxFPS ID -> server-authoritative RFX wallet
   walletTransactions: [], // append-only, HMAC chained token ledger
   walletRequestIndex: {}, // userId:requestId -> transactionId, prevents duplicate spending
   walletSecurityEvents: [], // suspicious wallet activity and integrity warnings
@@ -914,7 +937,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.7.2-rfx-ssv-verify-v2',
+      version: '6.8.0-rfx-economy',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -1204,11 +1227,19 @@ function friendUsageRecord(id, timezoneOffsetMinutes = 0) {
       day,
       usedSeconds: 0,
       tokenBonusSeconds: 0,
+      extraPackageAction: '',
+      extraPackagePurchasedAt: '',
+      paidUntil: '',
+      paidMinuteCharges: 0,
       timezoneOffsetMinutes: offset,
       updatedAt: new Date().toISOString(),
     };
   } else {
     current.timezoneOffsetMinutes = offset;
+    current.extraPackageAction = String(current.extraPackageAction || '');
+    current.extraPackagePurchasedAt = String(current.extraPackagePurchasedAt || '');
+    current.paidUntil = String(current.paidUntil || '');
+    current.paidMinuteCharges = Math.max(0, Math.round(Number(current.paidMinuteCharges || 0)));
   }
   return state.friendUsage[clean];
 }
@@ -1259,7 +1290,7 @@ function friendUsageSnapshot(id, timezoneOffsetMinutes = null) {
   const premium = !!isPremiumGranted(clean);
   const minutes = premium
     ? Number(state.appSettings?.premiumFriendMinutes || 60)
-    : Number(state.appSettings?.freeFriendMinutes || 15);
+    : Number(state.appSettings?.freeFriendMinutes || 20);
   const wheel = dailyWheelRecord(clean);
   const onlineBonusSeconds = Number(wheel.grants?.onlineBonusUntil || 0) > Date.now()
     ? Math.max(0, Number(wheel.grants?.onlineBonusSeconds || 0))
@@ -1267,16 +1298,28 @@ function friendUsageSnapshot(id, timezoneOffsetMinutes = null) {
   const tokenBonusSeconds = Math.max(0, Number(record.tokenBonusSeconds || 0));
   const limitSeconds = Math.max(0, Math.round(minutes * 60) + onlineBonusSeconds + tokenBonusSeconds);
   const usedSeconds = Math.max(0, Number(record.usedSeconds || 0));
+  const paidUntilMs = Date.parse(String(record.paidUntil || '')) || 0;
+  const paidRemainingSeconds = paidUntilMs > Date.now() ? Math.max(1, Math.ceil((paidUntilMs - Date.now()) / 1000)) : 0;
+  const freeRemainingSeconds = Math.max(0, limitSeconds - usedSeconds);
   return {
     id: clean,
     day: record.day,
     usedSeconds,
     limitSeconds,
-    remainingSeconds: Math.max(0, limitSeconds - usedSeconds),
+    remainingSeconds: freeRemainingSeconds,
+    accessRemainingSeconds: premium ? freeRemainingSeconds : Math.max(freeRemainingSeconds, paidRemainingSeconds),
+    paidMode: !premium && freeRemainingSeconds <= 0 && paidRemainingSeconds > 0,
+    paidUntil: paidRemainingSeconds > 0 ? new Date(paidUntilMs).toISOString() : '',
+    paidRemainingSeconds,
+    paidMinuteCharges: Math.max(0, Math.round(Number(record.paidMinuteCharges || 0))),
     timezoneOffsetMinutes: Number(record.timezoneOffsetMinutes || 0),
     premium,
     onlineBonusSeconds,
     tokenBonusSeconds,
+    extraPackageAction: String(record.extraPackageAction || ''),
+    extraPackagePurchasedAt: String(record.extraPackagePurchasedAt || ''),
+    extraPackageAvailable: !String(record.extraPackageAction || ''),
+    paidMinutePrice: Math.max(0, Math.round(Number(normalizeWalletSettings(state.walletSettings).prices.friends_paid_minute || 10))),
     updatedAt: record.updatedAt || new Date().toISOString(),
   };
 }
@@ -1533,6 +1576,7 @@ function normalizeWalletMetadata(value) {
 function walletSettingsSnapshot() {
   const settings = normalizeWalletSettings(state.walletSettings);
   return {
+    economyVersion: settings.economyVersion,
     enabled: settings.enabled,
     currencyName: settings.currencyName,
     welcomeBonus: settings.welcomeBonus,
@@ -1552,12 +1596,12 @@ function walletRecord(id) {
 function walletIsLocked(wallet) {
   if (!wallet) return null;
   if (wallet.locked === true && !wallet.lockedUntil) {
-    return { locked: true, reason: wallet.lockReason || 'Token işlemleri yönetici tarafından durduruldu.', until: '' };
+    return { locked: true, reason: wallet.lockReason || 'RFX işlemleri yönetici tarafından durduruldu.', until: '' };
   }
   if (wallet.lockedUntil) {
     const untilMs = Date.parse(wallet.lockedUntil);
     if (Number.isFinite(untilMs) && untilMs > Date.now()) {
-      return { locked: true, reason: wallet.lockReason || 'Token işlemleri geçici olarak durduruldu.', until: wallet.lockedUntil };
+      return { locked: true, reason: wallet.lockReason || 'RFX işlemleri geçici olarak durduruldu.', until: wallet.lockedUntil };
     }
     wallet.locked = false;
     wallet.lockedUntil = '';
@@ -1592,6 +1636,8 @@ function walletPublicSnapshot(id) {
     securityStatus: String(state.securityProfiles?.[clean]?.status || (lock ? 'locked' : 'clear')),
     reviewPending: (state.securityReviews || []).some((item) => item.userId === clean && item.status === 'pending'),
     playIntegrityMode: PLAY_INTEGRITY_MODE,
+    toolDiscountPercent: activeToolDiscount(clean)?.percent || 0,
+    toolDiscountUntil: activeToolDiscount(clean)?.until || '',
   };
 }
 
@@ -1627,12 +1673,14 @@ function walletAdStateSnapshot(id, timezoneOffsetMinutes = 0) {
   const settings = normalizeWalletSettings(state.walletSettings);
   const used = walletAdRewardCount(id, timezoneOffsetMinutes);
   const limit = Math.max(0, Math.round(Number(settings.dailyAdLimit || 0)));
+  const unlimited = limit === 0;
   return {
-    enabled: settings.enabled && limit > 0 && settings.adReward > 0,
+    enabled: settings.enabled && settings.adReward > 0,
+    unlimited,
     reward: Math.max(0, Math.round(Number(settings.adReward || 0))),
     dailyLimit: limit,
     dailyUsed: used,
-    dailyRemaining: Math.max(0, limit - used),
+    dailyRemaining: unlimited ? -1 : Math.max(0, limit - used),
     day: walletAdDayKey(timezoneOffsetMinutes),
     serverVerified: true,
   };
@@ -1690,8 +1738,8 @@ function walletCreateAdSession(id, timezoneOffsetMinutes = 0, deviceId = '') {
     const clean = normalizeId(id);
     const settings = normalizeWalletSettings(state.walletSettings);
     const offset = normalizeTimezoneOffset(timezoneOffsetMinutes);
-    if (!settings.enabled || settings.dailyAdLimit <= 0 || settings.adReward <= 0) {
-      throw Object.assign(new Error('Token kazanma reklamları şu anda kapalı.'), { code: 'reward_ads_disabled' });
+    if (!settings.enabled || settings.adReward <= 0) {
+      throw Object.assign(new Error('RFX kazanma reklamları şu anda kapalı.'), { code: 'reward_ads_disabled' });
     }
     if (isPremiumGranted(clean) && settings.premiumUnlimited) {
       throw Object.assign(new Error('Premium hesaplarda reklamlar tamamen kapalıdır.'), { code: 'premium_ads_disabled' });
@@ -1700,8 +1748,8 @@ function walletCreateAdSession(id, timezoneOffsetMinutes = 0, deviceId = '') {
       throw Object.assign(new Error('Kalıcı Supabase cüzdan bağlantısı yapılandırılmadı.'), { code: 'persistent_storage_required' });
     }
     const adState = walletAdStateSnapshot(clean, offset);
-    if (adState.dailyRemaining <= 0) {
-      throw Object.assign(new Error('Günlük token reklam hakkı doldu.'), { code: 'daily_ad_limit', adState });
+    if (!adState.unlimited && adState.dailyRemaining <= 0) {
+      throw Object.assign(new Error('Günlük RFX reklam hakkı doldu.'), { code: 'daily_ad_limit', adState });
     }
 
     cleanupWalletAdState();
@@ -1947,8 +1995,8 @@ async function processAdmobSsvCallback(rawQuery, ip = 'unknown') {
     const settings = normalizeWalletSettings(state.walletSettings);
     const offset = normalizeTimezoneOffset(session.timezoneOffsetMinutes);
     const adState = walletAdStateSnapshot(userId, offset);
-    if (!adState.enabled || adState.dailyRemaining <= 0) {
-      throw Object.assign(new Error('Günlük token reklam hakkı doldu.'), { code: 'daily_ad_limit' });
+    if (!adState.enabled || (!adState.unlimited && adState.dailyRemaining <= 0)) {
+      throw Object.assign(new Error('RFX reklam ödülü şu anda kullanılamıyor.'), { code: 'reward_ads_disabled' });
     }
     const reward = Math.max(0, Math.round(Number(settings.adReward || 0)));
     if (reward <= 0) {
@@ -3117,8 +3165,8 @@ function walletTrimLedgerIfNeeded() {
 async function walletCommitDeltaUnlocked({ id, delta, type, action, requestId, source, metadata = {} }) {
   const clean = normalizeId(id);
   const wallet = walletRecord(clean);
-  if (!wallet) throw Object.assign(new Error('RFX Token cüzdanı bulunamadı.'), { code: 'wallet_not_enrolled' });
-  if (!walletIntegrityStatus.ok) throw Object.assign(new Error('Token işlem defteri güvenlik kontrolünden geçemedi.'), { code: 'ledger_unavailable' });
+  if (!wallet) throw Object.assign(new Error('RFX cüzdanı bulunamadı.'), { code: 'wallet_not_enrolled' });
+  if (!walletIntegrityStatus.ok) throw Object.assign(new Error('RFX işlem defteri güvenlik kontrolünden geçemedi.'), { code: 'ledger_unavailable' });
   if (SUPABASE_SYNC_ENABLED && !SUPABASE_CONFIGURED) {
     throw Object.assign(new Error('Kalıcı Supabase cüzdan bağlantısı yapılandırılmadı.'), { code: 'persistent_storage_required' });
   }
@@ -3126,7 +3174,7 @@ async function walletCommitDeltaUnlocked({ id, delta, type, action, requestId, s
     throw Object.assign(new Error('Bulut veri sürümü çakıştı; token işlemleri güvenlik için durduruldu.'), { code: 'supabase_revision_conflict' });
   }
   const settings = normalizeWalletSettings(state.walletSettings);
-  if (!settings.enabled) throw Object.assign(new Error('RFX Token sistemi geçici olarak kapalı.'), { code: 'wallet_disabled' });
+  if (!settings.enabled) throw Object.assign(new Error('RFX sistemi geçici olarak kapalı.'), { code: 'wallet_disabled' });
   const lock = walletIsLocked(wallet);
   if (lock) throw Object.assign(new Error(lock.reason), { code: 'wallet_locked', lockedUntil: lock.until });
 
@@ -3136,7 +3184,7 @@ async function walletCommitDeltaUnlocked({ id, delta, type, action, requestId, s
   }
   const before = Math.max(0, Math.round(Number(wallet.balance || 0)));
   const after = before + signedDelta;
-  if (after < 0) throw Object.assign(new Error('Yetersiz RFX Token bakiyesi.'), { code: 'insufficient_balance', balance: before, required: Math.abs(signedDelta) });
+  if (after < 0) throw Object.assign(new Error('Yetersiz RFX bakiyesi.'), { code: 'insufficient_balance', balance: before, required: Math.abs(signedDelta) });
   if (after > WALLET_MAX_BALANCE) throw Object.assign(new Error('Cüzdan üst bakiye sınırına ulaştı.'), { code: 'wallet_balance_limit' });
 
   const previousState = {
@@ -3195,7 +3243,7 @@ async function walletCommitDeltaUnlocked({ id, delta, type, action, requestId, s
       else delete state.walletRequestIndex[key];
     }
     writeLocalStateNow();
-    throw Object.assign(new Error('Token işlemi kalıcı veritabanına güvenli şekilde kaydedilemedi.'), {
+    throw Object.assign(new Error('RFX işlemi kalıcı veritabanına güvenli şekilde kaydedilemedi.'), {
       code: error.code || 'wallet_persistence_failed',
     });
   }
@@ -3348,12 +3396,44 @@ function walletHistory(id, limit = 50, beforeSequence = Number.MAX_SAFE_INTEGER)
 }
 
 
+const TOOL_DISCOUNT_ACTIONS = new Set([
+  'game_readiness', 'relaxbench', 'sound_booster', 'virtual_ram',
+  'thermal_guard', 'network_stability', 'game_cleaner', 'touch_lab',
+  'gyro_test', 'device_health', 'battery_charge_lab', 'display_doctor',
+  'audio_haptic_lab', 'sensor_studio', 'storage_insight', 'gamer_break_coach',
+  'connectivity_center', 'gaming_extreme', 'app_lock', 'winsimpro',
+  'wide_optimization', 'thermal_pro', 'latency_optimizer', 'gfx_tool',
+  'shizuku_tools',
+]);
+
+function activeToolDiscount(id) {
+  const record = dailyWheelRecord(id);
+  const grants = record.grants || {};
+  const untilMs = Number(grants.toolDiscountUntil || 0);
+  const percent = Math.max(0, Math.min(90, Math.round(Number(grants.toolDiscountPercent || 0))));
+  if (!percent || !Number.isFinite(untilMs) || untilMs <= Date.now()) return null;
+  return { percent, untilMs, until: new Date(untilMs).toISOString() };
+}
+
+function walletEffectivePrice(id, action, basePrice) {
+  const cleanAction = walletActionKey(action);
+  const base = Math.max(0, Math.round(Number(basePrice || 0)));
+  const discount = TOOL_DISCOUNT_ACTIONS.has(cleanAction) ? activeToolDiscount(id) : null;
+  if (!discount || base <= 0) return { price: base, basePrice: base, discountPercent: 0, discountUntil: '' };
+  return {
+    price: Math.max(1, Math.ceil(base * (100 - discount.percent) / 100)),
+    basePrice: base,
+    discountPercent: discount.percent,
+    discountUntil: discount.until,
+  };
+}
+
+
 function walletServerBonusSeconds(action) {
   const key = walletActionKey(action);
   if (key === 'server_10m') return 10 * 60;
-  if (key === 'server_30m') return 30 * 60;
-  if (key === 'server_2h') return 2 * 60 * 60;
-  if (key === 'server_24h') return 24 * 60 * 60;
+  if (key === 'server_20m') return 20 * 60;
+  if (key === 'server_1h') return 60 * 60;
   return 0;
 }
 
@@ -3369,17 +3449,53 @@ function walletCommitSpendAction({ id, action, operationId, price, unlimited, me
       return {
         transaction: existing,
         duplicate: true,
-        friendUsage: walletServerBonusSeconds(action) > 0 ? friendUsageSnapshot(id, timezoneOffsetMinutes) : null,
+        friendUsage: (walletServerBonusSeconds(action) > 0 || walletActionKey(action) === 'friends_paid_minute')
+          ? friendUsageSnapshot(id, timezoneOffsetMinutes)
+          : null,
       };
     }
 
     const serverBonusSeconds = walletServerBonusSeconds(action);
+    const paidMinuteAction = walletActionKey(action) === 'friends_paid_minute';
     let usageRecord = null;
     let previousTokenBonusSeconds = 0;
+    let previousExtraPackageAction = '';
+    let previousExtraPackagePurchasedAt = '';
+    let previousPaidUntil = '';
+    let previousPaidMinuteCharges = 0;
     if (serverBonusSeconds > 0) {
       usageRecord = friendUsageRecord(id, timezoneOffsetMinutes);
+      if (usageRecord.extraPackageAction) {
+        throw Object.assign(new Error('Bugün yalnızca bir Extra sunucu süresi paketi alabilirsin.'), {
+          code: 'daily_extra_package_limit',
+        });
+      }
       previousTokenBonusSeconds = Math.max(0, Number(usageRecord.tokenBonusSeconds || 0));
+      previousExtraPackageAction = String(usageRecord.extraPackageAction || '');
+      previousExtraPackagePurchasedAt = String(usageRecord.extraPackagePurchasedAt || '');
       usageRecord.tokenBonusSeconds = previousTokenBonusSeconds + serverBonusSeconds;
+      usageRecord.extraPackageAction = action;
+      usageRecord.extraPackagePurchasedAt = new Date().toISOString();
+      usageRecord.updatedAt = new Date().toISOString();
+    }
+    if (paidMinuteAction) {
+      usageRecord = friendUsageRecord(id, timezoneOffsetMinutes);
+      const access = friendUsageSnapshot(id, timezoneOffsetMinutes);
+      if (access.premium) {
+        throw Object.assign(new Error('Premium kullanıcılar için dakika ücreti alınmaz.'), { code: 'premium_bypass_required' });
+      }
+      if (Number(access.remainingSeconds || 0) > 5) {
+        throw Object.assign(new Error('Ücretsiz Arkadaşlar süren henüz bitmedi.'), { code: 'free_time_remaining' });
+      }
+      const currentPaidUntilMs = Date.parse(String(usageRecord.paidUntil || '')) || 0;
+      if (currentPaidUntilMs > Date.now() + 1500) {
+        throw Object.assign(new Error('Ücretli dakika zaten aktif.'), { code: 'paid_minute_active', friendUsage: access });
+      }
+      previousPaidUntil = String(usageRecord.paidUntil || '');
+      previousPaidMinuteCharges = Math.max(0, Math.round(Number(usageRecord.paidMinuteCharges || 0)));
+      const nextPaidUntilMs = Math.max(Date.now(), currentPaidUntilMs) + 60 * 1000;
+      usageRecord.paidUntil = new Date(nextPaidUntilMs).toISOString();
+      usageRecord.paidMinuteCharges = previousPaidMinuteCharges + 1;
       usageRecord.updatedAt = new Date().toISOString();
     }
 
@@ -3389,7 +3505,7 @@ function walletCommitSpendAction({ id, action, operationId, price, unlimited, me
         delta: unlimited ? 0 : -price,
         type: serverBonusSeconds > 0
           ? 'SERVER_TIME_SPEND'
-          : (unlimited ? 'PREMIUM_BYPASS' : 'TOOL_SPEND'),
+          : (paidMinuteAction ? 'FRIENDS_MINUTE_SPEND' : (unlimited ? 'PREMIUM_BYPASS' : 'TOOL_SPEND')),
         action,
         requestId: operationId,
         source: 'app',
@@ -3398,16 +3514,26 @@ function walletCommitSpendAction({ id, action, operationId, price, unlimited, me
           price,
           premium: unlimited,
           serverBonusSeconds,
+          paidMinuteSeconds: paidMinuteAction ? 60 : 0,
+          paidUntil: paidMinuteAction ? String(usageRecord?.paidUntil || '') : '',
         },
       });
       return {
         transaction,
         duplicate: false,
-        friendUsage: serverBonusSeconds > 0 ? friendUsageSnapshot(id, timezoneOffsetMinutes) : null,
+        friendUsage: (serverBonusSeconds > 0 || paidMinuteAction) ? friendUsageSnapshot(id, timezoneOffsetMinutes) : null,
       };
     } catch (error) {
       if (usageRecord) {
-        usageRecord.tokenBonusSeconds = previousTokenBonusSeconds;
+        if (serverBonusSeconds > 0) {
+          usageRecord.tokenBonusSeconds = previousTokenBonusSeconds;
+          usageRecord.extraPackageAction = previousExtraPackageAction;
+          usageRecord.extraPackagePurchasedAt = previousExtraPackagePurchasedAt;
+        }
+        if (paidMinuteAction) {
+          usageRecord.paidUntil = previousPaidUntil;
+          usageRecord.paidMinuteCharges = previousPaidMinuteCharges;
+        }
         usageRecord.updatedAt = new Date().toISOString();
         writeLocalStateNow();
       }
@@ -3430,7 +3556,7 @@ function walletAuthenticate(socket, ip, id, walletKey, requestId, responseType) 
   const wallet = walletRecord(clean);
   if (!wallet || !walletKeyMatches(wallet, walletKey)) {
     walletAuthFailure(ip, clean, wallet ? 'invalid_wallet_key' : 'wallet_not_enrolled');
-    send(socket, { type: responseType, ok: false, requestId, code: wallet ? 'invalid_wallet_key' : 'wallet_not_enrolled', message: wallet ? 'Cüzdan anahtarı yanlış.' : 'RFX Token cüzdanı henüz oluşturulmadı.' });
+    send(socket, { type: responseType, ok: false, requestId, code: wallet ? 'invalid_wallet_key' : 'wallet_not_enrolled', message: wallet ? 'Cüzdan anahtarı yanlış.' : 'RFX cüzdanı henüz oluşturulmadı.' });
     return null;
   }
   walletClearAuthFailures(ip, clean);
@@ -3665,10 +3791,10 @@ const DAILY_WHEEL_CODE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const DAILY_WHEEL_REWARDS = [
   // Ağırlıklar 1000 üzerinden değerlendirilir. 100.000 RFX ekonomiyi korumak için %0,2'dir.
   { id: 'empty', label: 'Boş', wheelLabel: 'BOŞ', weight: 318, kind: 'empty' },
-  { id: 'rfx_1000', label: '1.000 RFX Token', wheelLabel: '1.000\nRFX', weight: 100, kind: 'rfx', amount: 1000 },
-  { id: 'rfx_100000', label: '100.000 RFX Token', wheelLabel: '100.000\nRFX', weight: 2, kind: 'rfx', amount: 100000 },
+  { id: 'rfx_1000', label: '1.000 RFX', wheelLabel: '1.000\nRFX', weight: 100, kind: 'rfx', amount: 1000 },
+  { id: 'rfx_100000', label: '100.000 RFX', wheelLabel: '100.000\nRFX', weight: 2, kind: 'rfx', amount: 100000 },
   { id: 'discount_50', label: 'Premium için %50 indirim', wheelLabel: '%50\nİNDİRİM', weight: 100, kind: 'code' },
-  { id: 'shizuku_1d', label: 'Shizuku araçları 1 gün açık', wheelLabel: 'SHIZUKU\n1 GÜN', weight: 150, kind: 'grant' },
+  { id: 'tool_discount_1d', label: 'Araçlarda 24 saat %50 RFX indirimi', wheelLabel: 'ARAÇLAR\n%50', weight: 150, kind: 'grant' },
   { id: 'coins_200', label: '200 Coin', wheelLabel: '200\nCOIN', weight: 200, kind: 'coin', amount: 200 },
   { id: 'premium_code_1h', label: 'Premium 1 saat', wheelLabel: 'PREMİUM\n1 SAAT', weight: 20, kind: 'code' },
   { id: 'retry', label: 'Tekrar dene', wheelLabel: 'TEKRAR\nDENE', weight: 110, kind: 'retry' },
@@ -3870,7 +3996,8 @@ function dailyWheelSnapshot(id) {
       onlineBonusSeconds: Number(grants.onlineBonusUntil || 0) > now ? Math.max(0, Number(grants.onlineBonusSeconds || 0)) : 0,
       onlineBonusUntil: Number(grants.onlineBonusUntil || 0) > now ? new Date(Number(grants.onlineBonusUntil)).toISOString() : '',
       winSimUntil: Number(grants.winSimUntil || 0) > now ? new Date(Number(grants.winSimUntil)).toISOString() : '',
-      shizukuUntil: Number(grants.shizukuUntil || 0) > now ? new Date(Number(grants.shizukuUntil)).toISOString() : '',
+      toolDiscountPercent: Number(grants.toolDiscountUntil || 0) > now ? Math.max(0, Number(grants.toolDiscountPercent || 0)) : 0,
+      toolDiscountUntil: Number(grants.toolDiscountUntil || 0) > now ? new Date(Number(grants.toolDiscountUntil)).toISOString() : '',
     },
     coins: Math.max(0, Math.round(Number(record.coins || 0))),
     premiumDiscount: activePremiumDiscount(clean),
@@ -3888,8 +4015,10 @@ async function applyDailyWheelReward(id, reward) {
   let code = '';
   let details = {};
 
-  if (reward.id === 'shizuku_1d') {
-    grants.shizukuUntil = Math.max(now, Number(grants.shizukuUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
+  if (reward.id === 'tool_discount_1d') {
+    grants.toolDiscountPercent = 50;
+    grants.toolDiscountUntil = Math.max(now, Number(grants.toolDiscountUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
+    details = { discountPercent: 50, expiresAt: new Date(grants.toolDiscountUntil).toISOString() };
   } else if (reward.kind === 'rfx') {
     const amount = Math.max(0, Math.round(Number(reward.amount || 0)));
     const transaction = await walletCommitDelta({
@@ -4532,7 +4661,7 @@ wss.on('connection', (socket, request) => {
       const rate = walletRateLimit(`spend:${socketIp}:${id}`, 12, 60 * 1000, 5 * 60 * 1000);
       if (!rate.ok) {
         walletSecurityEvent('wallet_spend_rate_limited', { id, ip: socketIp }, 'warning');
-        send(socket, { type: 'wallet_spend', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok hızlı token harcama isteği gönderildi.' });
+        send(socket, { type: 'wallet_spend', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok hızlı RFX harcama isteği gönderildi.' });
         return;
       }
       const operationId = String(data.operationId || data.requestId || requestId || '').trim();
@@ -4569,7 +4698,7 @@ wss.on('connection', (socket, request) => {
             createdAt: existing.createdAt,
           },
           wallet: walletPublicSnapshot(id),
-          friendUsage: walletServerBonusSeconds(action) > 0
+          friendUsage: (walletServerBonusSeconds(action) > 0 || action === 'friends_paid_minute')
             ? friendUsageSnapshot(id, data.timezoneOffsetMinutes)
             : undefined,
           serverTime: new Date().toISOString(),
@@ -4589,11 +4718,13 @@ wss.on('connection', (socket, request) => {
         send(socket, { type: 'wallet_spend', ok: false, requestId, code: integrityAuth.code, message: integrityAuth.message, wallet: walletPublicSnapshot(id) });
         return;
       }
-      const price = Math.max(0, Math.round(Number(settings.prices[action] || 0)));
+      const basePrice = Math.max(0, Math.round(Number(settings.prices[action] || 0)));
+      const effectivePrice = walletEffectivePrice(id, action, basePrice);
+      const price = effectivePrice.price;
       const serverBonusSeconds = walletServerBonusSeconds(action);
       // Premium bypass applies to tools/optimizations. Server-time packages are
       // always charged until Google Play entitlement verification arrives in Token D.
-      const unlimited = !!isPremiumGranted(id) && settings.premiumUnlimited && serverBonusSeconds <= 0;
+      const unlimited = !!isPremiumGranted(id) && settings.premiumUnlimited && serverBonusSeconds <= 0 && action !== 'friends_paid_minute';
       try {
         const spendResult = await walletCommitSpendAction({
           id,
@@ -4601,14 +4732,19 @@ wss.on('connection', (socket, request) => {
           operationId,
           price,
           unlimited,
-          metadata: data.metadata,
+          metadata: {
+            ...(data.metadata && typeof data.metadata === 'object' ? data.metadata : {}),
+            basePrice: effectivePrice.basePrice,
+            discountPercent: effectivePrice.discountPercent,
+            discountUntil: effectivePrice.discountUntil,
+          },
           timezoneOffsetMinutes: data.timezoneOffsetMinutes,
         });
         const transaction = spendResult.transaction;
         sendTo(id, {
           type: 'wallet_changed',
           wallet: walletPublicSnapshot(id),
-          reason: unlimited ? 'premium_bypass' : 'token_spent',
+          reason: unlimited ? 'premium_bypass' : 'rfx_spent',
           transaction: {
             id: transaction.id,
             amount: transaction.amount,
@@ -4625,6 +4761,9 @@ wss.on('connection', (socket, request) => {
           requestId,
           charged: !unlimited && price > 0,
           price,
+          basePrice: effectivePrice.basePrice,
+          discountPercent: effectivePrice.discountPercent,
+          discountUntil: effectivePrice.discountUntil,
           transaction: {
             id: transaction.id,
             type: transaction.type,
@@ -4899,7 +5038,7 @@ wss.on('connection', (socket, request) => {
           type: 'daily_wheel_spin', ok: false, requestId,
           code: error.code || 'wheel_reward_failed',
           message: error.code === 'wallet_not_enrolled'
-            ? 'RFX ödülü için önce Token Merkezi üzerinden cüzdanını oluştur.'
+            ? 'RFX ödülü için önce RFX Merkezi üzerinden cüzdanını oluştur.'
             : (error.message || 'Çark ödülü güvenli şekilde kaydedilemedi.'),
           state: before,
         });
@@ -5048,7 +5187,7 @@ wss.on('connection', (socket, request) => {
       const amount = Math.round(Number(data.amount || 0));
       const reason = String(data.reason || 'Yönetici düzeltmesi').slice(0, 240);
       if (!validId(id) || !walletRecord(id)) {
-        send(socket, { type: 'admin_error', ok: false, requestId, message: 'Kayıtlı RFX Token cüzdanı olan geçerli bir RelaxFPS ID gerekli.' });
+        send(socket, { type: 'admin_error', ok: false, requestId, message: 'Kayıtlı RFX cüzdanı olan geçerli bir RelaxFPS ID gerekli.' });
         return;
       }
       if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > 10000000) {
@@ -6180,6 +6319,23 @@ setInterval(() => {
   for (const id of activeFriendUsage.keys()) {
     const snapshot = friendUsageSnapshot(id);
     sendTo(id, { type: 'friend_usage', ...snapshot });
+    const paymentOverdue = !snapshot.premium
+      && Number(snapshot.remainingSeconds || 0) <= 0
+      && Number(snapshot.paidRemainingSeconds || 0) <= 0
+      && Number(snapshot.usedSeconds || 0) >= Number(snapshot.limitSeconds || 0) + 8;
+    if (paymentOverdue) {
+      sendTo(id, {
+        type: 'friend_usage_payment_required',
+        message: '20 ücretsiz dakika tamamlandı. Devam etmek için dakika başına 10 RFX gerekir.',
+        friendUsage: snapshot,
+      });
+      const sockets = clients.get(id);
+      if (sockets) {
+        for (const socket of Array.from(sockets)) {
+          try { socket.close(4008, 'RFX_REQUIRED'); } catch (_) {}
+        }
+      }
+    }
   }
 }, 10000).unref?.();
 
@@ -6213,7 +6369,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.7.0-rfx-wheel-overlay running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.8.0-rfx-economy running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');
