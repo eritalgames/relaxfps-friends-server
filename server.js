@@ -914,7 +914,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.7.0-rfx-wheel-overlay',
+      version: '6.7.1-rfx-ssv-verify',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -1858,6 +1858,31 @@ async function processAdmobSsvCallback(rawQuery, ip = 'unknown') {
   if (!/^[A-Za-z0-9._:-]{8,180}$/.test(transactionId)) {
     throw Object.assign(new Error('Geçersiz AdMob transaction_id.'), { code: 'invalid_transaction_id' });
   }
+  if (normalizedAdUnit(adUnit) !== normalizedAdUnit(ADMOB_REWARDED_AD_UNIT_ID)) {
+    throw Object.assign(new Error('Beklenmeyen AdMob reklam birimi.'), { code: 'unexpected_ad_unit' });
+  }
+  if (!timestampMs || Math.abs(Date.now() - timestampMs) > ADMOB_CALLBACK_TOLERANCE_MS) {
+    throw Object.assign(new Error('SSV zaman damgası kabul edilen aralığın dışında.'), { code: 'stale_callback' });
+  }
+
+  // AdMob panelindeki "Geri çağırma URL'sini doğrula" aracı user_id ve
+  // custom_data alanları boş bırakıldığında imzalı bir test çağrısı gönderir.
+  // Bu çağrı yalnız URL/imza doğrulaması içindir; hiçbir cüzdana ödül yazılmaz.
+  const validationOnly = userId.length === 0 && customData.length === 0;
+  if (validationOnly) {
+    walletSecurityEvent('admob_ssv_validation_probe', {
+      ip,
+      transactionId,
+      adUnit: normalizedAdUnit(adUnit),
+      rewardItem,
+      callbackRewardAmount,
+    }, 'info');
+    return {
+      statusCode: 200,
+      payload: { ok: true, validationOnly: true },
+    };
+  }
+
   if (!validId(userId)) {
     throw Object.assign(new Error('Geçersiz SSV user_id.'), { code: 'invalid_user_id' });
   }
@@ -1867,12 +1892,6 @@ async function processAdmobSsvCallback(rawQuery, ip = 'unknown') {
   const sessionId = customData.slice('rfxad:'.length);
   if (!/^ad_[a-f0-9]{40}$/.test(sessionId)) {
     throw Object.assign(new Error('Geçersiz reklam oturumu.'), { code: 'invalid_ad_session' });
-  }
-  if (normalizedAdUnit(adUnit) !== normalizedAdUnit(ADMOB_REWARDED_AD_UNIT_ID)) {
-    throw Object.assign(new Error('Beklenmeyen AdMob reklam birimi.'), { code: 'unexpected_ad_unit' });
-  }
-  if (!timestampMs || Math.abs(Date.now() - timestampMs) > ADMOB_CALLBACK_TOLERANCE_MS) {
-    throw Object.assign(new Error('SSV zaman damgası kabul edilen aralığın dışında.'), { code: 'stale_callback' });
   }
 
   return withWalletMutation(async () => {
