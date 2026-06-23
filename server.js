@@ -914,7 +914,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.6.0-rfx-ui-tools',
+      version: '6.7.0-rfx-wheel-overlay',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -3640,15 +3640,15 @@ function publicBenchmarkLeaderboard(limit = 100) {
 const DAILY_WHEEL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const DAILY_WHEEL_CODE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const DAILY_WHEEL_REWARDS = [
-  { id: 'online_20m', label: '+20 dakika çevrim içi süre', wheelLabel: '+20 DK\nONLINE', weight: 20, kind: 'online' },
-  { id: 'premium_code_1h', label: '1 saat Premium referans kodu', wheelLabel: '1 SAAT\nPREMIUM KOD', weight: 4, kind: 'code' },
-  { id: 'winsim_1d', label: '1 gün WinSimPro oturumu', wheelLabel: 'WINSIMPRO\n1 GÜN', weight: 10, kind: 'grant' },
-  { id: 'discount_20', label: 'Premium ilk ay %20 indirim kodu', wheelLabel: '%20\nİNDİRİM', weight: 2, kind: 'code' },
-  { id: 'retry', label: 'Tekrar dene', wheelLabel: 'TEKRAR\nDENE', weight: 40, kind: 'retry' },
-  { id: 'shizuku_1d', label: '1 günlük Shizuku Tools erişimi', wheelLabel: 'SHIZUKU\n1 GÜN', weight: 2, kind: 'grant' },
-  { id: 'discount_40', label: 'Premium ilk ay %40 indirim kodu', wheelLabel: '%40\nİNDİRİM', weight: 2, kind: 'code' },
-  // Kalan %20 olasılık boş dilimdir; ödül vermez ve 24 saatlik bekleme süresini başlatır.
-  { id: 'empty', label: 'Boş', wheelLabel: 'BOŞ', weight: 20, kind: 'empty' },
+  // Ağırlıklar 1000 üzerinden değerlendirilir. 100.000 RFX ekonomiyi korumak için %0,2'dir.
+  { id: 'empty', label: 'Boş', wheelLabel: 'BOŞ', weight: 318, kind: 'empty' },
+  { id: 'rfx_1000', label: '1.000 RFX Token', wheelLabel: '1.000\nRFX', weight: 100, kind: 'rfx', amount: 1000 },
+  { id: 'rfx_100000', label: '100.000 RFX Token', wheelLabel: '100.000\nRFX', weight: 2, kind: 'rfx', amount: 100000 },
+  { id: 'discount_50', label: 'Premium için %50 indirim', wheelLabel: '%50\nİNDİRİM', weight: 100, kind: 'code' },
+  { id: 'shizuku_1d', label: 'Shizuku araçları 1 gün açık', wheelLabel: 'SHIZUKU\n1 GÜN', weight: 150, kind: 'grant' },
+  { id: 'coins_200', label: '200 Coin', wheelLabel: '200\nCOIN', weight: 200, kind: 'coin', amount: 200 },
+  { id: 'premium_code_1h', label: 'Premium 1 saat', wheelLabel: 'PREMİUM\n1 SAAT', weight: 20, kind: 'code' },
+  { id: 'retry', label: 'Tekrar dene', wheelLabel: 'TEKRAR\nDENE', weight: 110, kind: 'retry' },
 ];
 
 function dailyWheelRecord(id) {
@@ -3660,6 +3660,7 @@ function dailyWheelRecord(id) {
   current.nextSpinAt = String(current.nextSpinAt || '');
   current.history = Array.isArray(current.history) ? current.history : [];
   current.grants = current.grants && typeof current.grants === 'object' ? current.grants : {};
+  current.coins = Math.max(0, Math.round(Number(current.coins || 0)));
   state.dailyWheel[clean] = current;
   return current;
 }
@@ -3794,20 +3795,20 @@ function createWheelPromoCode(id, reward) {
       createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(), source: 'daily_wheel',
     };
   } else {
-    const percent = reward.id === 'discount_40' ? 40 : 20;
-    code = randomWheelCode(percent === 40 ? 'RFX40' : 'RFX20');
+    const percent = 50;
+    code = randomWheelCode('RFX50');
     item = {
       code,
       ownerId: clean,
       rewardType: 'premium_discount',
-      durationMinutes: 7 * 24 * 60,
+      durationMinutes: 24 * 60,
       totalMinutes: 0,
       discountPercent: percent,
-      offerTag: percent === 40 ? 'relaxfps_wheel_40' : 'relaxfps_wheel_20',
+      offerTag: 'relaxfps_wheel_50',
       maxUses: 1,
       active: true,
-      expiresAt: new Date(now + DAILY_WHEEL_CODE_LIFETIME_MS).toISOString(),
-      label: percent === 40 ? 'Çark ödülü: Premium ilk ay %40 indirim' : 'Çark ödülü: Premium ilk ay %20 indirim',
+      expiresAt: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+      label: 'Çark ödülü: Premium için %50 indirim',
       note: 'Requires matching Google Play subscription offer tag',
       usedBy: [], uses: 0,
       createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(), source: 'daily_wheel',
@@ -3848,37 +3849,50 @@ function dailyWheelSnapshot(id) {
       winSimUntil: Number(grants.winSimUntil || 0) > now ? new Date(Number(grants.winSimUntil)).toISOString() : '',
       shizukuUntil: Number(grants.shizukuUntil || 0) > now ? new Date(Number(grants.shizukuUntil)).toISOString() : '',
     },
+    coins: Math.max(0, Math.round(Number(record.coins || 0))),
     premiumDiscount: activePremiumDiscount(clean),
     rewards: DAILY_WHEEL_REWARDS.map(({ id, label, wheelLabel, weight }) => ({ id, label, wheelLabel, weight })),
     serverTime: new Date(now).toISOString(),
   };
 }
 
-function applyDailyWheelReward(id, reward) {
+async function applyDailyWheelReward(id, reward) {
   const clean = normalizeId(id);
   const record = dailyWheelRecord(clean);
   const now = Date.now();
   const grants = record.grants || (record.grants = {});
+  const historyId = `wheel-${now}-${crypto.randomInt(100000)}`;
   let code = '';
   let details = {};
 
-  if (reward.id === 'online_20m') {
-    grants.onlineBonusSeconds = 20 * 60;
-    grants.onlineBonusUntil = now + DAILY_WHEEL_COOLDOWN_MS;
-  } else if (reward.id === 'winsim_1d') {
-    grants.winSimUntil = Math.max(now, Number(grants.winSimUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
-  } else if (reward.id === 'shizuku_1d') {
+  if (reward.id === 'shizuku_1d') {
     grants.shizukuUntil = Math.max(now, Number(grants.shizukuUntil || 0)) + DAILY_WHEEL_COOLDOWN_MS;
+  } else if (reward.kind === 'rfx') {
+    const amount = Math.max(0, Math.round(Number(reward.amount || 0)));
+    const transaction = await walletCommitDelta({
+      id: clean,
+      delta: amount,
+      type: 'WHEEL_REWARD',
+      action: reward.id,
+      requestId: historyId,
+      source: 'daily_wheel',
+      metadata: { rewardId: reward.id, wheelHistoryId: historyId },
+    });
+    details = { amount, balanceAfter: transaction.balanceAfter, transactionId: transaction.id };
+  } else if (reward.kind === 'coin') {
+    const amount = Math.max(0, Math.round(Number(reward.amount || 0)));
+    record.coins = Math.max(0, Math.round(Number(record.coins || 0))) + amount;
+    details = { amount, coinBalance: record.coins };
   } else if (reward.kind === 'code') {
     const created = createWheelPromoCode(clean, reward);
     code = created.code;
-    details = reward.id.startsWith('discount_')
-      ? { discountPercent: Number(created.promo.discountPercent || 0), offerTag: created.promo.offerTag || '' }
+    details = reward.id === 'discount_50'
+      ? { discountPercent: Number(created.promo.discountPercent || 0), offerTag: created.promo.offerTag || '', expiresAt: created.promo.expiresAt || '' }
       : { durationMinutes: Number(created.promo.durationMinutes || 0) };
   }
 
   const historyItem = {
-    id: `wheel-${now}-${crypto.randomInt(100000)}`,
+    id: historyId,
     rewardId: reward.id,
     label: reward.label,
     code,
@@ -4847,14 +4861,26 @@ wss.on('connection', (socket, request) => {
         return;
       }
       const reward = chooseDailyWheelReward();
-      const result = applyDailyWheelReward(id, reward);
-      adminAudit('daily_wheel_spin', { id, rewardId: reward.id, code: result.code || '' });
-      send(socket, {
-        type: 'daily_wheel_spin', ok: true, requestId,
-        reward: { id: reward.id, label: reward.label, wheelLabel: reward.wheelLabel, weight: reward.weight, retry: reward.id === 'retry' },
-        result,
-        state: dailyWheelSnapshot(id),
-      });
+      try {
+        const result = await applyDailyWheelReward(id, reward);
+        adminAudit('daily_wheel_spin', { id, rewardId: reward.id, code: result.code || '' });
+        send(socket, {
+          type: 'daily_wheel_spin', ok: true, requestId,
+          reward: { id: reward.id, label: reward.label, wheelLabel: reward.wheelLabel, weight: reward.weight, retry: reward.id === 'retry' },
+          result,
+          state: dailyWheelSnapshot(id),
+        });
+      } catch (error) {
+        walletSecurityEvent('daily_wheel_reward_failed', { id, rewardId: reward.id, code: error.code || '', message: error.message || '' }, 'warning');
+        send(socket, {
+          type: 'daily_wheel_spin', ok: false, requestId,
+          code: error.code || 'wheel_reward_failed',
+          message: error.code === 'wallet_not_enrolled'
+            ? 'RFX ödülü için önce Token Merkezi üzerinden cüzdanını oluştur.'
+            : (error.message || 'Çark ödülü güvenli şekilde kaydedilemedi.'),
+          state: before,
+        });
+      }
       return;
     }
 
@@ -6164,7 +6190,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.6.0-rfx-ui-tools running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.7.0-rfx-wheel-overlay running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');

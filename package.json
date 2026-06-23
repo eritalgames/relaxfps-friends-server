@@ -1,6 +1,6 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "6.5.0",
+  "version": "6.7.0",
   "description": "RELAXFPS backend with RFX Token wallet, AdMob SSV, Google Play verification, Play Integrity risk controls, and Supabase persistence",
   "main": "server.js",
   "scripts": {
