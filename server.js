@@ -942,7 +942,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.9.1-device-identity-reset',
+      version: '6.10.0-rfx-codes-overlay',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -5863,88 +5863,225 @@ wss.on('connection', (socket, request) => {
       const id = normalizeId(data.id || currentId);
       const code = String(data.code || '').trim().toUpperCase().replace(/\s+/g, '');
       if (!validId(id) || !code) {
-        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Geçerli RelaxFPS kimliği ve kod gerekli.' });
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'invalid_request', message: 'Geçerli RelaxFPS kimliği ve kod gerekli.' });
+        return;
+      }
+      const rate = walletRateLimit(`promo:${socketIp}:${id}`, 12, 60 * 1000, 5 * 60 * 1000);
+      if (!rate.ok) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok fazla kod denemesi yapıldı. Bir süre sonra tekrar dene.' });
         return;
       }
       state.promoCodes = state.promoCodes || {};
       const item = state.promoCodes[code];
       if (!item || item.active === false) {
-        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Kod geçersiz veya devre dışı.' });
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'promo_invalid', message: 'Kod geçersiz veya devre dışı.' });
         return;
       }
       if (item.ownerId && normalizeId(item.ownerId) !== id) {
-        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Bu kişisel kod başka bir RelaxFPS kimliğine ait.' });
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'promo_owner_mismatch', message: 'Bu kişisel kod başka bir RelaxFPS kimliğine ait.' });
         return;
       }
-      if (item.expiresAt && Date.parse(item.expiresAt) <= Date.now()) {
-        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Bu kodun süresi dolmuş.' });
+      const now = Date.now();
+      if (item.startsAt && Date.parse(item.startsAt) > now) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'promo_not_started', message: 'Bu kodun kullanım süresi henüz başlamadı.' });
         return;
       }
-      item.usedBy = Array.isArray(item.usedBy) ? item.usedBy : [];
-      if (item.usedBy.includes(id)) {
-        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Bu kodu daha önce kullandın.' });
+      if (item.expiresAt && Date.parse(item.expiresAt) <= now) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'promo_expired', message: 'Bu kodun süresi dolmuş.' });
         return;
       }
-      const maxUses = Math.max(0, Number(item.maxUses || 0));
-      if (maxUses > 0 && item.usedBy.length >= maxUses) {
-        send(socket, { type: 'promo_redeemed', ok: false, requestId, message: 'Kod kullanım sınırına ulaştı.' });
+      if (item.premiumOnly === true && !isPremiumGranted(id)) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'premium_required', message: 'Bu kod yalnız Premium kullanıcılar içindir.' });
         return;
       }
 
       const rewardType = String(item.rewardType || 'premium');
+      if (rewardType === 'rfx' && !String(data.walletKey || '').trim()) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'wallet_auth_required', message: 'RFX kodunu RFX Merkezi içindeki + düğmesinden kullan.' });
+        return;
+      }
+      if (rewardType !== 'rfx' && String(data.walletKey || '').trim()) {
+        send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'not_rfx_code', message: 'Bu kod RFX kodu değil. İlgili ödül ekranından kullan.' });
+        return;
+      }
+      const deviceHash = walletDeviceHash(data.deviceId);
+      const legacyUsedBy = Array.isArray(item.usedBy) ? item.usedBy.map(normalizeId).filter(validId) : [];
+      item.redemptions = Array.isArray(item.redemptions) ? item.redemptions : legacyUsedBy.map((userId, index) => ({
+        id: userId,
+        deviceHash: '',
+        redeemedAt: item.updatedAt || item.createdAt || new Date(0).toISOString(),
+        legacy: true,
+        index,
+      }));
+      const totalUses = item.redemptions.length;
+      const maxUses = Math.max(0, Number(item.maxUses || 0));
+      const perAccountLimit = Math.max(1, Math.min(Number(item.perAccountLimit || 1), 100));
+      const accountUses = item.redemptions.filter((entry) => normalizeId(entry?.id) === id).length;
+      const perDeviceLimit = Math.max(0, Math.min(Number(item.perDeviceLimit ?? 1), 100));
+      if (rewardType !== 'rfx') {
+        if (maxUses > 0 && totalUses >= maxUses) {
+          send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'promo_limit_reached', message: 'Kod kullanım sınırına ulaştı.' });
+          return;
+        }
+        if (accountUses >= perAccountLimit) {
+          send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'promo_account_limit', message: 'Bu kod için hesap kullanım sınırına ulaştın.' });
+          return;
+        }
+        if (perDeviceLimit > 0 && deviceHash) {
+          const deviceUses = item.redemptions.filter((entry) => String(entry?.deviceHash || '') === deviceHash).length;
+          if (deviceUses >= perDeviceLimit) {
+            send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'promo_device_limit', message: 'Bu kod bu cihazda daha önce kullanılmış.' });
+            return;
+          }
+        }
+      }
+
       const durationMinutes = Math.max(1, Math.min(Number(item.durationMinutes || 60), 525600));
       const totalMinutes = Math.max(10, Math.min(Number(item.totalMinutes || durationMinutes), 1440));
       const reward = {
         type: rewardType,
         durationMinutes,
         totalMinutes,
+        amount: Math.max(0, Math.min(Math.round(Number(item.rfxAmount || 0)), 10000000)),
         discountPercent: Math.max(0, Math.min(Number(item.discountPercent || 0), 90)),
         offerTag: String(item.offerTag || '').slice(0, 100),
         label: String(item.label || item.note || 'Promosyon ödülü').slice(0, 240),
       };
+
       let premiumGrant = null;
-      if (rewardType === 'premium') {
-        state.premiumUsers = state.premiumUsers || {};
-        const currentGrant = isPremiumGranted(id);
-        const currentUntilMs = currentGrant && currentGrant.until ? Date.parse(currentGrant.until) : 0;
-        const baseMs = Number.isFinite(currentUntilMs) && currentUntilMs > Date.now() ? currentUntilMs : Date.now();
-        const until = new Date(baseMs + durationMinutes * 60 * 1000).toISOString();
-        state.premiumUsers[id] = {
-          ...(currentGrant || {}),
-          id,
-          minutes: Number(currentGrant?.minutes || 0) + durationMinutes,
-          until,
-          time: new Date().toISOString(),
-          source: `promo:${code}`,
-        };
-        premiumGrant = state.premiumUsers[id];
-        sendTo(id, { type: 'premium_granted', grant: premiumGrant });
-      } else if (rewardType === 'premium_discount') {
-        state.premiumDiscounts = state.premiumDiscounts || {};
-        const percent = Math.max(1, Math.min(Number(item.discountPercent || 0), 90));
-        const expiresAt = new Date(Date.now() + Math.max(60, durationMinutes) * 60 * 1000).toISOString();
-        state.premiumDiscounts[id] = {
-          id, percent, offerTag: String(item.offerTag || ''), expiresAt,
-          sourceCode: code, redeemedAt: new Date().toISOString(),
-        };
-        reward.discountPercent = percent;
-        reward.offerTag = String(item.offerTag || '');
-        reward.expiresAt = expiresAt;
+      let walletTransaction = null;
+      let duplicateTransaction = false;
+      if (rewardType === 'rfx') {
+        const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'promo_redeemed');
+        if (!wallet) return;
+        if (!deviceHash || !(wallet.devices || []).includes(deviceHash)) {
+          send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'device_not_verified', message: 'Bu cihaz RFX cüzdanıyla doğrulanamadı.' });
+          return;
+        }
+        if (item.newUsersOnly === true) {
+          const createdMs = Date.parse(wallet.createdAt || '');
+          const maxAgeDays = Math.max(1, Math.min(Number(item.newUserMaxAgeDays || 7), 90));
+          if (!Number.isFinite(createdMs) || now - createdMs > maxAgeDays * 24 * 60 * 60 * 1000) {
+            send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'new_user_required', message: `Bu kod yalnız ilk ${maxAgeDays} günündeki yeni kullanıcılar içindir.` });
+            return;
+          }
+        }
+        const operationId = String(data.operationId || '').trim();
+        if (!validWalletRequestId(operationId)) {
+          send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'invalid_operation_id', message: 'Kod işlemi için geçerli işlem kimliği gerekli.' });
+          return;
+        }
+        const existingTransaction = walletFindTransaction(id, operationId);
+        if (existingTransaction) {
+          send(socket, {
+            type: 'promo_redeemed', ok: true, requestId, code, duplicate: true,
+            reward, transaction: existingTransaction, wallet: walletPublicSnapshot(id),
+            serverTime: new Date().toISOString(), message: reward.label || 'Kod daha önce başarıyla kullanıldı.',
+          });
+          return;
+        }
+        if (reward.amount <= 0) {
+          send(socket, { type: 'promo_redeemed', ok: false, requestId, code: 'invalid_reward_amount', message: 'Bu kod için geçerli RFX miktarı ayarlanmamış.' });
+          return;
+        }
+
+        const redemption = { id, deviceHash, redeemedAt: new Date().toISOString(), operationId, rewardType, amount: reward.amount };
+        const previousRedemptions = item.redemptions.slice();
+        const previousUsedBy = Array.isArray(item.usedBy) ? item.usedBy.slice() : [];
+        const previousUses = Number(item.uses || 0);
+        try {
+          walletTransaction = await withWalletMutation(async () => {
+            const lockedExisting = walletFindTransaction(id, operationId);
+            if (lockedExisting) {
+              duplicateTransaction = true;
+              return lockedExisting;
+            }
+            const lockedTotalUses = item.redemptions.length;
+            const lockedAccountUses = item.redemptions.filter((entry) => normalizeId(entry?.id) === id).length;
+            const lockedDeviceUses = deviceHash
+              ? item.redemptions.filter((entry) => String(entry?.deviceHash || '') === deviceHash).length
+              : 0;
+            if (maxUses > 0 && lockedTotalUses >= maxUses) {
+              throw Object.assign(new Error('Kod kullanım sınırına ulaştı.'), { code: 'promo_limit_reached' });
+            }
+            if (lockedAccountUses >= perAccountLimit) {
+              throw Object.assign(new Error('Bu kod için hesap kullanım sınırına ulaştın.'), { code: 'promo_account_limit' });
+            }
+            if (perDeviceLimit > 0 && deviceHash && lockedDeviceUses >= perDeviceLimit) {
+              throw Object.assign(new Error('Bu kod bu cihazda daha önce kullanılmış.'), { code: 'promo_device_limit' });
+            }
+            item.redemptions.push(redemption);
+            item.usedBy = Array.from(new Set(item.redemptions.map((entry) => normalizeId(entry?.id)).filter(validId)));
+            item.uses = item.redemptions.length;
+            item.updatedAt = new Date().toISOString();
+            return walletCommitDeltaUnlocked({
+              id,
+              delta: reward.amount,
+              type: 'PROMO_CODE',
+              action: 'promo_code',
+              requestId: operationId,
+              source: 'promo_code',
+              metadata: { code, label: reward.label, promoRewardType: rewardType },
+            });
+          });
+        } catch (error) {
+          item.redemptions = previousRedemptions;
+          item.usedBy = previousUsedBy;
+          item.uses = previousUses;
+          item.updatedAt = new Date().toISOString();
+          writeLocalStateNow();
+          send(socket, { type: 'promo_redeemed', ok: false, requestId, code: error.code || 'promo_wallet_failed', message: error.message || 'RFX kodu güvenli şekilde uygulanamadı.' });
+          return;
+        }
+        sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: 'promo_code', serverTime: new Date().toISOString() });
+      } else {
+        if (rewardType === 'premium') {
+          state.premiumUsers = state.premiumUsers || {};
+          const currentGrant = isPremiumGranted(id);
+          const currentUntilMs = currentGrant && currentGrant.until ? Date.parse(currentGrant.until) : 0;
+          const baseMs = Number.isFinite(currentUntilMs) && currentUntilMs > now ? currentUntilMs : now;
+          const until = new Date(baseMs + durationMinutes * 60 * 1000).toISOString();
+          state.premiumUsers[id] = {
+            ...(currentGrant || {}), id,
+            minutes: Number(currentGrant?.minutes || 0) + durationMinutes,
+            until, time: new Date().toISOString(), source: `promo:${code}`,
+          };
+          premiumGrant = state.premiumUsers[id];
+          sendTo(id, { type: 'premium_granted', grant: premiumGrant });
+        } else if (rewardType === 'premium_discount') {
+          state.premiumDiscounts = state.premiumDiscounts || {};
+          const percent = Math.max(1, Math.min(Number(item.discountPercent || 0), 90));
+          const expiresAt = new Date(now + Math.max(60, durationMinutes) * 60 * 1000).toISOString();
+          state.premiumDiscounts[id] = {
+            id, percent, offerTag: String(item.offerTag || ''), expiresAt,
+            sourceCode: code, redeemedAt: new Date().toISOString(),
+          };
+          reward.discountPercent = percent;
+          reward.offerTag = String(item.offerTag || '');
+          reward.expiresAt = expiresAt;
+        }
+        item.redemptions.push({ id, deviceHash, redeemedAt: new Date().toISOString(), rewardType });
+        item.usedBy = Array.from(new Set(item.redemptions.map((entry) => normalizeId(entry?.id)).filter(validId)));
+        item.uses = item.redemptions.length;
+        item.updatedAt = new Date().toISOString();
+        saveStateSoon();
       }
-      item.usedBy.push(id);
-      item.uses = item.usedBy.length;
-      item.updatedAt = new Date().toISOString();
-      adminAudit('promo_redeemed', { code, id, rewardType, durationMinutes, totalMinutes });
-      saveStateSoon();
+
+      adminAudit('promo_redeemed', { code, id, rewardType, durationMinutes, totalMinutes, amount: reward.amount, deviceHash: deviceHash ? deviceHash.slice(0, 10) : '' });
       send(socket, {
-        type: 'promo_redeemed',
-        ok: true,
-        requestId,
-        code,
-        reward,
-        premiumGrant,
+        type: 'promo_redeemed', ok: true, requestId, code, reward, premiumGrant,
+        duplicate: duplicateTransaction,
+        transaction: walletTransaction ? {
+          id: walletTransaction.id,
+          amount: walletTransaction.amount,
+          balanceAfter: walletTransaction.balanceAfter,
+          createdAt: walletTransaction.createdAt,
+        } : null,
+        wallet: rewardType === 'rfx' ? walletPublicSnapshot(id) : undefined,
         serverTime: new Date().toISOString(),
-        message: reward.label || 'Kod başarıyla kullanıldı.',
+        message: rewardType === 'rfx'
+          ? `${reward.amount} RFX hesabına eklendi.`
+          : (reward.label || 'Kod başarıyla kullanıldı.'),
       });
       return;
     }
@@ -6236,29 +6373,46 @@ wss.on('connection', (socket, request) => {
       const code = String(data.code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 48);
       if (!code) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Promo code required' });
       const existing = state.promoCodes[code] || {};
-      const rewardTypes = ['premium', 'ad_free', 'winsim', 'friends_minutes', 'premium_discount'];
-      const rewardType = rewardTypes.includes(String(data.rewardType || '')) ? String(data.rewardType) : 'premium';
+      const rewardTypes = ['rfx', 'premium', 'ad_free', 'winsim', 'friends_minutes', 'premium_discount'];
+      const rewardType = rewardTypes.includes(String(data.rewardType || '')) ? String(data.rewardType) : 'rfx';
+      const existingRedemptions = Array.isArray(existing.redemptions)
+        ? existing.redemptions
+        : (Array.isArray(existing.usedBy) ? existing.usedBy : []).map((userId, index) => ({
+            id: normalizeId(userId),
+            deviceHash: '',
+            redeemedAt: existing.updatedAt || existing.createdAt || new Date(0).toISOString(),
+            legacy: true,
+            index,
+          })).filter((entry) => validId(entry.id));
       const item = {
         ...existing,
         code,
         rewardType,
+        rfxAmount: Math.max(0, Math.min(Math.round(Number(data.rfxAmount ?? existing.rfxAmount ?? 0)), 10000000)),
         durationMinutes: Math.max(1, Math.min(Number(data.durationMinutes || 60), 525600)),
         totalMinutes: Math.max(0, Math.min(Number(data.totalMinutes || data.durationMinutes || 30), 1440)),
         ownerId: normalizeId(data.ownerId || existing.ownerId || ''),
         discountPercent: Math.max(0, Math.min(Number(data.discountPercent || existing.discountPercent || 0), 90)),
         offerTag: String(data.offerTag || existing.offerTag || '').slice(0, 100),
-        maxUses: Math.max(0, Math.min(Number(data.maxUses || 0), 1000000)),
+        maxUses: Math.max(0, Math.min(Number(data.maxUses ?? existing.maxUses ?? 0), 1000000)),
+        perAccountLimit: Math.max(1, Math.min(Number(data.perAccountLimit ?? existing.perAccountLimit ?? 1), 100)),
+        perDeviceLimit: Math.max(0, Math.min(Number(data.perDeviceLimit ?? existing.perDeviceLimit ?? 1), 100)),
+        premiumOnly: data.premiumOnly === true,
+        newUsersOnly: data.newUsersOnly === true,
+        newUserMaxAgeDays: Math.max(1, Math.min(Number(data.newUserMaxAgeDays ?? existing.newUserMaxAgeDays ?? 7), 90)),
         active: data.active !== false,
+        startsAt: String(data.startsAt || '').slice(0, 80),
         expiresAt: String(data.expiresAt || '').slice(0, 80),
         label: String(data.label || '').slice(0, 240),
         note: String(data.note || '').slice(0, 1000),
+        redemptions: existingRedemptions,
         usedBy: Array.isArray(existing.usedBy) ? existing.usedBy : [],
-        uses: Array.isArray(existing.usedBy) ? existing.usedBy.length : Number(existing.uses || 0),
+        uses: existingRedemptions.length || Number(existing.uses || 0),
         createdAt: existing.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
       state.promoCodes[code] = item;
-      adminAudit('upsert_promo_code', { code, rewardType, active: item.active, maxUses: item.maxUses });
+      adminAudit('upsert_promo_code', { code, rewardType, rfxAmount: item.rfxAmount, active: item.active, maxUses: item.maxUses });
       saveStateSoon();
       send(socket, { type: 'admin_upsert_promo_code', ok: true, requestId, item });
       return;
@@ -7284,7 +7438,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.9.1-device-identity-reset running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.10.0-rfx-codes-overlay running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');

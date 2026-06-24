@@ -420,15 +420,78 @@ function clearPanelForm(){ $('#panelForm')?.reset();$('#panelId').value='';panel
 
 function renderPromos() {
   const items = snapshot.promoCodes || [];
-  $('#contentTabBody').innerHTML = `<div class="grid two-col"><section class="card"><h3>Promosyon kodu</h3><form id="promoForm" class="form-grid">${field('promoCode','Kod','text','',true)}<label><span>Ödül tipi</span><select id="promoType"><option value="premium">Premium</option><option value="ad_free">Reklamsız</option><option value="winsim">WinSimPro</option><option value="friends_minutes">Arkadaş süresi</option><option value="premium_discount">Premium indirimi</option></select></label>${field('promoDuration','Süre (dakika)','number','60')}${field('promoTotal','Toplam arkadaş dakikası','number','30')}${field('promoDiscount','İndirim %','number','0')}${field('promoOfferTag','Google Play offer tag')}${field('promoOwner','Sahip RelaxFPS ID')}${field('promoMaxUses','Maksimum kullanım','number','1')}${field('promoExpires','Son kullanım','datetime-local')}${field('promoLabel','Kullanıcı etiketi','text','','false','full')}${area('promoNote','Yönetici notu',false,'full')}<label class="check-row full"><input id="promoActive" type="checkbox" checked> Kod aktif</label><div class="actions full"><button class="primary" type="submit">Kodu kaydet</button><button id="promoClear" class="ghost" type="button">Temizle</button></div></form></section>
+  $('#contentTabBody').innerHTML = `<div class="grid two-col"><section class="card"><h3>Promosyon / RFX kodu</h3><form id="promoForm" class="form-grid">
+  ${field('promoCode','Kod','text','',true)}
+  <label><span>Ödül tipi</span><select id="promoType"><option value="rfx">RFX</option><option value="premium">Premium</option><option value="ad_free">Reklamsız</option><option value="winsim">WinSimPro</option><option value="friends_minutes">Arkadaş süresi</option><option value="premium_discount">Premium indirimi</option></select></label>
+  ${field('promoRfxAmount','Verilecek RFX','number','500')}
+  ${field('promoDuration','Süre (dakika)','number','60')}
+  ${field('promoTotal','Toplam arkadaş dakikası','number','30')}
+  ${field('promoDiscount','İndirim %','number','0')}
+  ${field('promoOfferTag','Google Play offer tag')}
+  ${field('promoOwner','Sahip RelaxFPS ID')}
+  ${field('promoMaxUses','Toplam kullanım sınırı (0 = sınırsız)','number','0')}
+  ${field('promoPerAccount','Hesap başına kullanım','number','1')}
+  ${field('promoPerDevice','Cihaz başına kullanım (0 = kapalı)','number','1')}
+  ${field('promoStarts','Başlangıç','datetime-local')}
+  ${field('promoExpires','Son kullanım','datetime-local')}
+  ${field('promoNewUserDays','Yeni kullanıcı süresi (gün)','number','7')}
+  ${field('promoLabel','Kullanıcı etiketi','text','','false','full')}
+  ${area('promoNote','Yönetici notu',false,'full')}
+  <label class="check-row"><input id="promoPremiumOnly" type="checkbox"> Yalnız Premium</label>
+  <label class="check-row"><input id="promoNewUsersOnly" type="checkbox"> Yalnız yeni kullanıcı</label>
+  <label class="check-row full"><input id="promoActive" type="checkbox" checked> Kod aktif</label>
+  <div class="actions full"><button class="primary" type="submit">Kodu kaydet</button><button id="promoClear" class="ghost" type="button">Temizle</button></div></form></section>
   <section class="card"><h3>Kodlar (${items.length})</h3><div id="promoList" class="list">${items.map(promoItem).join('') || '<div class="empty">Kod yok.</div>'}</div></section></div>`;
-  $('#promoForm').addEventListener('submit', savePromo); $('#promoClear').addEventListener('click', clearPromoForm); $('#promoList').addEventListener('click', handlePromoAction);
+  $('#promoForm').addEventListener('submit', savePromo);
+  $('#promoClear').addEventListener('click', clearPromoForm);
+  $('#promoList').addEventListener('click', handlePromoAction);
+  $('#promoType').addEventListener('change', updatePromoFieldVisibility);
+  updatePromoFieldVisibility();
 }
-function promoItem(item){return `<article class="list-item" data-code="${escapeHtml(item.code)}"><div class="list-item-head"><h4 class="code">${escapeHtml(item.code)}</h4><span class="badge ${item.active===false?'bad':'ok'}">${item.active===false?'PASİF':'AKTİF'}</span></div><p>${escapeHtml(item.label||item.rewardType)} • ${escapeHtml(item.uses||0)}/${item.maxUses===0?'∞':escapeHtml(item.maxUses)}</p><div class="actions"><button data-action="copy">Kopyala</button><button data-action="edit">Düzenle</button><button data-action="delete" class="danger">Sil</button></div></article>`}
-async function savePromo(event){event.preventDefault();const b=event.submitter;setBusy(b,true);try{await request('admin_upsert_promo_code',{code:$('#promoCode').value.trim(),rewardType:$('#promoType').value,durationMinutes:Number($('#promoDuration').value||60),totalMinutes:Number($('#promoTotal').value||30),discountPercent:Number($('#promoDiscount').value||0),offerTag:$('#promoOfferTag').value.trim(),ownerId:$('#promoOwner').value.trim().toUpperCase(),maxUses:Number($('#promoMaxUses').value||0),expiresAt:toIsoOrEmpty($('#promoExpires').value),label:$('#promoLabel').value.trim(),note:$('#promoNote').value.trim(),active:$('#promoActive').checked});clearPromoForm();await refreshSnapshot();toast('Promosyon kodu kaydedildi.');}catch(e){toast(e.message,true)}finally{setBusy(b,false)}}
+function updatePromoFieldVisibility(){
+  const type=$('#promoType')?.value||'rfx';
+  const rfx=$('#promoRfxAmount')?.closest('label');
+  if(rfx)rfx.classList.toggle('hidden',type!=='rfx');
+}
+function promoItem(item){
+  const reward=item.rewardType==='rfx'?`${escapeHtml(item.rfxAmount||0)} RFX`:escapeHtml(item.label||item.rewardType);
+  const start=item.startsAt?` • Başlangıç ${fmtDate(item.startsAt)}`:'';
+  const end=item.expiresAt?` • Bitiş ${fmtDate(item.expiresAt)}`:'';
+  return `<article class="list-item" data-code="${escapeHtml(item.code)}"><div class="list-item-head"><h4 class="code">${escapeHtml(item.code)}</h4><span class="badge ${item.active===false?'bad':'ok'}">${item.active===false?'PASİF':'AKTİF'}</span></div><p>${reward} • ${escapeHtml(item.uses||0)}/${item.maxUses===0?'∞':escapeHtml(item.maxUses)} kullanım${start}${end}</p><p>Hesap: ${escapeHtml(item.perAccountLimit||1)} • Cihaz: ${item.perDeviceLimit===0?'kapalı':escapeHtml(item.perDeviceLimit||1)}${item.premiumOnly?' • Premium':''}${item.newUsersOnly?' • Yeni kullanıcı':''}</p><div class="actions"><button data-action="copy">Kopyala</button><button data-action="edit">Düzenle</button><button data-action="delete" class="danger">Sil</button></div></article>`
+}
+async function savePromo(event){
+  event.preventDefault();const b=event.submitter;setBusy(b,true);
+  try{
+    await request('admin_upsert_promo_code',{
+      code:$('#promoCode').value.trim(),rewardType:$('#promoType').value,
+      rfxAmount:Number($('#promoRfxAmount').value||0),durationMinutes:Number($('#promoDuration').value||60),
+      totalMinutes:Number($('#promoTotal').value||30),discountPercent:Number($('#promoDiscount').value||0),
+      offerTag:$('#promoOfferTag').value.trim(),ownerId:$('#promoOwner').value.trim().toUpperCase(),
+      maxUses:Number($('#promoMaxUses').value||0),perAccountLimit:Number($('#promoPerAccount').value||1),
+      perDeviceLimit:Number($('#promoPerDevice').value||0),startsAt:toIsoOrEmpty($('#promoStarts').value),
+      expiresAt:toIsoOrEmpty($('#promoExpires').value),premiumOnly:$('#promoPremiumOnly').checked,
+      newUsersOnly:$('#promoNewUsersOnly').checked,newUserMaxAgeDays:Number($('#promoNewUserDays').value||7),
+      label:$('#promoLabel').value.trim(),note:$('#promoNote').value.trim(),active:$('#promoActive').checked
+    });
+    clearPromoForm();await refreshSnapshot();toast('Promosyon kodu kaydedildi.');
+  }catch(e){toast(e.message,true)}finally{setBusy(b,false)}
+}
 function handlePromoAction(event){const b=event.target.closest('button[data-action]');if(!b)return;const code=b.closest('[data-code]').dataset.code;const item=(snapshot.promoCodes||[]).find(x=>x.code===code);if(!item)return;if(b.dataset.action==='copy'){navigator.clipboard.writeText(code);toast('Kod kopyalandı.');}else if(b.dataset.action==='edit'){fillPromo(item);}else confirmAction('Kodu sil',`${code} kalıcı olarak silinsin mi?`,async()=>{await request('admin_delete_promo_code',{code});await refreshSnapshot();toast('Kod silindi.');});}
-function fillPromo(i){$('#promoCode').value=i.code||'';$('#promoType').value=i.rewardType||'premium';$('#promoDuration').value=i.durationMinutes||60;$('#promoTotal').value=i.totalMinutes||30;$('#promoDiscount').value=i.discountPercent||0;$('#promoOfferTag').value=i.offerTag||'';$('#promoOwner').value=i.ownerId||'';$('#promoMaxUses').value=i.maxUses||0;$('#promoExpires').value=toLocalInput(i.expiresAt);$('#promoLabel').value=i.label||'';$('#promoNote').value=i.note||'';$('#promoActive').checked=i.active!==false;window.scrollTo({top:0,behavior:'smooth'});}
-function clearPromoForm(){ $('#promoForm')?.reset();$('#promoType').value='premium';$('#promoDuration').value='60';$('#promoTotal').value='30';$('#promoDiscount').value='0';$('#promoMaxUses').value='1';$('#promoActive').checked=true; }
+function fillPromo(i){
+  $('#promoCode').value=i.code||'';$('#promoType').value=i.rewardType||'rfx';$('#promoRfxAmount').value=i.rfxAmount||0;
+  $('#promoDuration').value=i.durationMinutes||60;$('#promoTotal').value=i.totalMinutes||30;$('#promoDiscount').value=i.discountPercent||0;
+  $('#promoOfferTag').value=i.offerTag||'';$('#promoOwner').value=i.ownerId||'';$('#promoMaxUses').value=i.maxUses||0;
+  $('#promoPerAccount').value=i.perAccountLimit||1;$('#promoPerDevice').value=i.perDeviceLimit??1;
+  $('#promoStarts').value=toLocalInput(i.startsAt);$('#promoExpires').value=toLocalInput(i.expiresAt);
+  $('#promoPremiumOnly').checked=i.premiumOnly===true;$('#promoNewUsersOnly').checked=i.newUsersOnly===true;
+  $('#promoNewUserDays').value=i.newUserMaxAgeDays||7;$('#promoLabel').value=i.label||'';$('#promoNote').value=i.note||'';
+  $('#promoActive').checked=i.active!==false;updatePromoFieldVisibility();window.scrollTo({top:0,behavior:'smooth'});
+}
+function clearPromoForm(){
+  $('#promoForm')?.reset();$('#promoType').value='rfx';$('#promoRfxAmount').value='500';$('#promoDuration').value='60';
+  $('#promoTotal').value='30';$('#promoDiscount').value='0';$('#promoMaxUses').value='0';$('#promoPerAccount').value='1';
+  $('#promoPerDevice').value='1';$('#promoNewUserDays').value='7';$('#promoActive').checked=true;updatePromoFieldVisibility();
+}
 
 function renderUsers() {
   const users = snapshot.users || [];
