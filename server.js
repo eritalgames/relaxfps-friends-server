@@ -256,22 +256,16 @@ function defaultWalletSettings() {
       gyro_test: 15,
       network_stability: 20,
       connectivity_center: 20,
+      rfx_antivirus: 35,
+      rfx_device_lab: 25,
+      storage_cleaner: 20,
       relaxbench: 25,
-      gaming_extreme: 100,
-      app_lock: 75,
-      winsimpro: 100,
-      shizuku_tools: 100,
       optimize_normal: 30,
       optimize_advanced: 50,
-      wide_optimization: 50,
-      thermal_pro: 75,
-      latency_optimizer: 75,
-      gfx_tool: 50,
       friends_paid_minute: 10,
       server_10m: 90,
       server_20m: 170,
       server_1h: 450,
-      premium_tool_trial: 250,
       issue_diagnosis: 20,
     },
     updatedAt: '',
@@ -284,10 +278,16 @@ function normalizeWalletSettings(value) {
   const incomingVersion = Math.max(0, Math.round(Number(incoming.economyVersion || 0)));
   const migrateToV2 = incomingVersion < 2;
   const incomingPrices = incoming.prices && typeof incoming.prices === 'object' ? incoming.prices : {};
+  const premiumOnlyActions = new Set([
+    'gaming_extreme', 'app_lock', 'winsimpro', 'shizuku_tools',
+    'wide_optimization', 'thermal_pro', 'latency_optimizer', 'gfx_tool',
+    'premium_tool_trial',
+  ]);
   const prices = { ...defaults.prices };
   for (const [key, rawValue] of Object.entries(incomingPrices)) {
     const cleanKey = String(key || '').trim().toLowerCase().replace(/[^a-z0-9_:-]/g, '').slice(0, 80);
     const amount = Math.round(Number(rawValue || 0));
+    if (premiumOnlyActions.has(cleanKey)) continue;
     if (cleanKey && Number.isFinite(amount) && amount >= 0 && amount <= 10000000) prices[cleanKey] = amount;
   }
   if (migrateToV2) {
@@ -942,7 +942,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.10.0-rfx-codes-overlay',
+      version: '6.11.0-power-tools-ads-announcements',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -3454,9 +3454,7 @@ const TOOL_DISCOUNT_ACTIONS = new Set([
   'thermal_guard', 'network_stability', 'game_cleaner', 'touch_lab',
   'gyro_test', 'device_health', 'battery_charge_lab', 'display_doctor',
   'audio_haptic_lab', 'sensor_studio', 'storage_insight', 'gamer_break_coach',
-  'connectivity_center', 'gaming_extreme', 'app_lock', 'winsimpro',
-  'wide_optimization', 'thermal_pro', 'latency_optimizer', 'gfx_tool',
-  'shizuku_tools',
+  'connectivity_center', 'rfx_antivirus', 'rfx_device_lab', 'storage_cleaner',
 ]);
 
 function activeToolDiscount(id) {
@@ -3636,12 +3634,17 @@ function isPublicHttpUrl(value) {
   }
 }
 
+function isInternalAnnouncement(item) {
+  const source = String(item?.sourceName || '').trim().toUpperCase();
+  return source === 'RELAXFPS' || String(item?.buttonAction || '').trim() !== '' || String(item?.panelId || '').trim() !== '';
+}
+
 function publicAnnouncements() {
   const now = Date.now();
   return (state.announcements || [])
     .filter((item) => {
       if (!item || item.active === false) return false;
-      if (!String(item.sourceName || '').trim() || !isPublicHttpUrl(item.link)) return false;
+      if (!isInternalAnnouncement(item) && (!String(item.sourceName || '').trim() || !isPublicHttpUrl(item.link))) return false;
       if (!item.expiresAt) return true;
       const expires = Date.parse(item.expiresAt);
       return !Number.isFinite(expires) || expires > now;
@@ -6307,8 +6310,9 @@ wss.on('connection', (socket, request) => {
       if (!item.title || !item.summary || !item.body) {
         return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Duyuru başlığı, özeti ve içeriği zorunludur.' });
       }
-      if (!item.sourceName || !isPublicHttpUrl(item.link)) {
-        return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Kaynak adı ve geçerli http/https kaynak bağlantısı zorunludur.' });
+      if (!item.sourceName) item.sourceName = 'RELAXFPS';
+      if (!isInternalAnnouncement(item) && !isPublicHttpUrl(item.link)) {
+        return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Harici haberlerde geçerli http/https kaynak bağlantısı zorunludur. RELAXFPS duyurularında bağlantı boş bırakılabilir.' });
       }
       state.announcements = state.announcements || [];
       const index = state.announcements.findIndex((x) => x.id === id);
@@ -7438,7 +7442,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.10.0-rfx-codes-overlay running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.11.0-power-tools-ads-announcements running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');

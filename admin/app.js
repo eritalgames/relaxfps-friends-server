@@ -343,10 +343,10 @@ function renderAnnouncements() {
           <input id="annId" type="hidden">
           ${field('annTitle','Başlık','text','',true,'full')}
           ${field('annCategory','Kategori','text','Duyuru')}
-          ${field('annSource','Kaynak adı','text','',true)}
+          ${field('annSource','Kaynak adı','text','RELAXFPS')}
           ${area('annSummary','Kısa özet',true,'full')}
           ${area('annBody','Tam içerik',true,'full')}
-          ${field('annLink','Kaynak bağlantısı','url','',true,'full')}
+          ${field('annLink','Kaynak bağlantısı (harici haberlerde zorunlu)','url','','','full')}
           ${field('annButton','Buton yazısı')}${field('annAction','Buton aksiyonu')}
           ${field('annPanel','Özel panel ID')}${field('annOrder','Sıra','number','0')}
           ${field('annPriority','Öncelik 0-100','number','0')}${field('annExpires','Bitiş tarihi','datetime-local')}
@@ -370,8 +370,10 @@ function renderAnnouncements() {
   $('#announcementList').addEventListener('click', handleAnnouncementAction);
 }
 function announcementItem(item) {
-  const sourceOk = item.sourceName && /^https?:\/\//i.test(item.link || '');
-  return `<article class="list-item" data-id="${escapeHtml(item.id)}"><div class="list-item-head"><div><h4>${escapeHtml(item.title)}</h4><span class="badge ${item.active === false ? 'bad' : 'ok'}">${item.active === false ? 'PASİF' : 'AKTİF'}</span> ${item.pinned ? '<span class="badge warn">SABİT</span>' : ''} <span class="badge ${sourceOk ? 'ok' : 'bad'}">${sourceOk ? 'KAYNAKLI' : 'KAYNAK EKSİK'}</span></div><span class="muted">${escapeHtml(fmtDate(item.updatedAt || item.time))}</span></div><p><strong>${escapeHtml(item.summary || '')}</strong></p><p>${escapeHtml(item.body)}</p><p class="muted">${escapeHtml(item.sourceName || '—')} • ${escapeHtml(item.link || '—')}</p><div class="actions"><button data-action="edit">Düzenle</button><button data-action="delete" class="danger">Sil</button></div></article>`;
+  const internal = String(item.sourceName || '').trim().toUpperCase() === 'RELAXFPS' || !!String(item.buttonAction || '').trim() || !!String(item.panelId || '').trim();
+  const sourceOk = internal || (item.sourceName && /^https?:\/\//i.test(item.link || ''));
+  const sourceBadge = internal ? 'RELAXFPS' : (sourceOk ? 'KAYNAKLI' : 'KAYNAK EKSİK');
+  return `<article class="list-item" data-id="${escapeHtml(item.id)}"><div class="list-item-head"><div><h4>${escapeHtml(item.title)}</h4><span class="badge ${item.active === false ? 'bad' : 'ok'}">${item.active === false ? 'PASİF' : 'AKTİF'}</span> ${item.pinned ? '<span class="badge warn">SABİT</span>' : ''} <span class="badge ${sourceOk ? 'ok' : 'bad'}">${sourceBadge}</span></div><span class="muted">${escapeHtml(fmtDate(item.updatedAt || item.time))}</span></div><p><strong>${escapeHtml(item.summary || '')}</strong></p><p>${escapeHtml(item.body)}</p><p class="muted">${escapeHtml(item.sourceName || 'RELAXFPS')} • ${escapeHtml(item.link || 'Uygulama içi duyuru')}</p><div class="actions"><button data-action="edit">Düzenle</button><button data-action="delete" class="danger">Sil</button></div></article>`;
 }
 async function saveAnnouncement(event) {
   event.preventDefault(); const button = event.submitter; setBusy(button, true);
@@ -403,7 +405,7 @@ function fillAnnouncement(item) {
   const preview = $('#annImagePreview'); if (announcementImageBase64) { preview.src = `data:image/*;base64,${announcementImageBase64}`; preview.classList.remove('hidden'); } else preview.classList.add('hidden');
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
-function clearAnnouncementForm() { $('#announcementForm')?.reset(); $('#annId').value=''; $('#annCategory').value='Duyuru'; $('#annSource').value=''; $('#annOrder').value='0'; $('#annPriority').value='0'; $('#annActive').checked=true; announcementImageBase64=''; announcementVideoBase64=''; $('#annImagePreview').classList.add('hidden'); }
+function clearAnnouncementForm() { $('#announcementForm')?.reset(); $('#annId').value=''; $('#annCategory').value='Duyuru'; $('#annSource').value='RELAXFPS'; $('#annOrder').value='0'; $('#annPriority').value='0'; $('#annActive').checked=true; announcementImageBase64=''; announcementVideoBase64=''; $('#annImagePreview').classList.add('hidden'); }
 
 function renderPanels() {
   const items = snapshot.customPanels || [];
