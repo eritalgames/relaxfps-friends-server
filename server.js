@@ -319,7 +319,9 @@ const state = {
   announcements: [], // {id,title,body,imageBase64,videoBase64,link,buttonLabel,panelId,active,order,time}
   customPanels: [], // {id,title,body,imageBase64,buttonLabel,buttonUrl,time}
   feedback: [], // {id,from,title,body,reply,status,time}
-  developerMessages: [], // {id,to,title,body,time,read}
+  developerMessages: [], // legacy developer messages
+  developerChatMessages: [], // unified one-way developer/support conversation
+  developerCampaigns: [], // bulk developer-message delivery summaries
   premiumUsers: {}, // id -> {id,until,months,time}
   bannedUsers: {}, // id -> {id,reason,until,time}
   appSettings: defaultAppSettings(),
@@ -349,6 +351,7 @@ const state = {
   walletSecurityEvents: [], // suspicious wallet activity and integrity warnings
   walletAdSessions: {}, // sessionId -> pending/verified rewarded-ad SSV session
   walletAdTransactions: {}, // AdMob transactionId -> user/session/ledger transaction
+  walletSpendReservations: {}, // reservationId -> pending RFX spend awaiting ad completion
   playPurchases: {}, // purchaseTokenHash -> verified Google Play consumable purchase
   playPurchaseOrderIndex: {}, // optional orderId -> purchaseTokenHash (not used as primary key)
   playPurchaseSync: { lastVoidedSyncAt: '', startTimeMs: 0, lastError: '' },
@@ -377,6 +380,23 @@ function applyLoadedState(parsed) {
   state.customPanels = Array.isArray(state.customPanels) ? state.customPanels : [];
   state.feedback = Array.isArray(state.feedback) ? state.feedback : [];
   state.developerMessages = Array.isArray(state.developerMessages) ? state.developerMessages : [];
+  state.developerChatMessages = Array.isArray(state.developerChatMessages) ? state.developerChatMessages : [];
+  state.developerCampaigns = Array.isArray(state.developerCampaigns) ? state.developerCampaigns : [];
+  if (!state.developerChatMessages.length && state.developerMessages.length) {
+    state.developerChatMessages = state.developerMessages.map((item) => ({
+      id: item.id || `devmsg-migrated-${Date.now()}-${Math.floor(Math.random() * 99999)}`,
+      userId: normalizeId(item.to),
+      direction: 'admin',
+      kind: 'text',
+      title: String(item.title || 'Geliştiriciden mesajınız var').slice(0, 120),
+      body: String(item.body || '').slice(0, 2500),
+      time: item.time || new Date().toISOString(),
+      deliveredAt: item.deliveredAt || '',
+      readAt: item.read === true ? (item.readAt || item.time || new Date().toISOString()) : '',
+      bulk: item.bulk === true,
+      campaignId: item.campaignId || '',
+    })).filter((item) => validId(item.userId));
+  }
   state.premiumUsers = state.premiumUsers || {};
   state.bannedUsers = state.bannedUsers || {};
   state.appSettings = normalizeAppSettings(state.appSettings);
@@ -407,6 +427,7 @@ function applyLoadedState(parsed) {
   state.walletSecurityEvents = Array.isArray(state.walletSecurityEvents) ? state.walletSecurityEvents : [];
   state.walletAdSessions = state.walletAdSessions && typeof state.walletAdSessions === 'object' ? state.walletAdSessions : {};
   state.walletAdTransactions = state.walletAdTransactions && typeof state.walletAdTransactions === 'object' ? state.walletAdTransactions : {};
+  state.walletSpendReservations = state.walletSpendReservations && typeof state.walletSpendReservations === 'object' ? state.walletSpendReservations : {};
   state.playPurchases = state.playPurchases && typeof state.playPurchases === 'object' ? state.playPurchases : {};
   state.playPurchaseOrderIndex = state.playPurchaseOrderIndex && typeof state.playPurchaseOrderIndex === 'object' ? state.playPurchaseOrderIndex : {};
   state.playPurchaseSync = state.playPurchaseSync && typeof state.playPurchaseSync === 'object'
@@ -942,7 +963,7 @@ async function handleHttpRequest(req, res) {
     sendJsonResponse(res, 200, {
       ok: true,
       service: 'RelaxFPS Friends Server',
-      version: '6.11.0-power-tools-ads-announcements',
+      version: '6.13.0-ui-news-feedback-stability',
       online: onlineIds().length,
       adminStudio: true,
       wallet: {
@@ -3769,6 +3790,8 @@ function adminSnapshot() {
     customPanels: (state.customPanels || []).slice().reverse(),
     feedback: (state.feedback || []).slice().reverse(),
     developerMessages: (state.developerMessages || []).slice().reverse(),
+    developerChatMessages: (state.developerChatMessages || []).slice().reverse().slice(0, 10000),
+    developerCampaigns: (state.developerCampaigns || []).slice().reverse().slice(0, 500),
     appSettings: normalizeAppSettings(state.appSettings),
     crashReports: (state.crashReports || []).slice().reverse().slice(0, 120),
     clientEvents: (state.clientEvents || []).slice().reverse().slice(0, 200),
@@ -3801,6 +3824,8 @@ function adminSnapshot() {
       activeDiscounts: Object.keys(state.premiumDiscounts || {}).length,
       wallets: Object.keys(state.wallets || {}).length,
       walletTransactions: (state.walletTransactions || []).length,
+      pendingWalletReservations: Object.values(state.walletSpendReservations || {}).filter((item) => item && item.status === 'pending' && Date.parse(item.expiresAt || '') > Date.now()).length,
+      developerChatMessages: (state.developerChatMessages || []).length,
       walletIntegrity: walletIntegrityStatus.ok,
       walletSecurityConfigured: WALLET_SECURITY_CONFIGURED,
       playIntegrityMode: PLAY_INTEGRITY_MODE,
@@ -3828,10 +3853,108 @@ function requireAdmin(socket, adminSessionToken, requestId) {
   return true;
 }
 
-function pushDeveloperMessages(id, socket) {
+function publicDeveloperChatMessage(item) {
+  return {
+    id: String(item?.id || ''),
+    userId: normalizeId(item?.userId || item?.to),
+    direction: item?.direction === 'user' ? 'user' : 'admin',
+    kind: String(item?.kind || 'text').slice(0, 40),
+    title: String(item?.title || '').slice(0, 160),
+    body: String(item?.body || '').slice(0, 4000),
+    status: String(item?.status || '').slice(0, 40),
+    relatedFeedbackId: String(item?.relatedFeedbackId || '').slice(0, 120),
+    actionLabel: String(item?.actionLabel || '').slice(0, 100),
+    action: String(item?.action || '').slice(0, 500),
+    time: String(item?.time || ''),
+    deliveredAt: String(item?.deliveredAt || ''),
+    readAt: String(item?.readAt || ''),
+    bulk: item?.bulk === true,
+    campaignId: String(item?.campaignId || ''),
+    deleted: item?.deleted === true,
+  };
+}
+
+function developerChatFor(id, limit = 250) {
   const clean = normalizeId(id);
-  const items = (state.developerMessages || []).filter((item) => item.to === clean && item.read !== true).slice(-10);
-  if (items.length) send(socket, { type: 'developer_messages', items });
+  const maxItems = Math.max(1, Math.min(Number(limit || 250), 500));
+  return (state.developerChatMessages || [])
+    .filter((item) => normalizeId(item.userId || item.to) === clean)
+    .slice(-maxItems)
+    .map(publicDeveloperChatMessage);
+}
+
+function developerChatUnreadCount(id) {
+  const clean = normalizeId(id);
+  return (state.developerChatMessages || []).filter((item) =>
+    normalizeId(item.userId || item.to) === clean &&
+    item.direction !== 'user' &&
+    !item.readAt
+  ).length;
+}
+
+function storeDeveloperChatMessage({ userId, direction = 'admin', kind = 'text', title = '', body = '', status = '', relatedFeedbackId = '', actionLabel = '', action = '', bulk = false, campaignId = '' }) {
+  const clean = normalizeId(userId);
+  const cleanTitle = String(title || '').slice(0, 160);
+  const cleanBody = String(body || '').slice(0, 4000);
+  if (!validId(clean) || (!cleanTitle.trim() && !cleanBody.trim())) return null;
+  state.developerChatMessages = Array.isArray(state.developerChatMessages) ? state.developerChatMessages : [];
+  const now = new Date().toISOString();
+  const item = {
+    id: `devchat-${Date.now()}-${crypto.randomBytes(5).toString('hex')}`,
+    userId: clean,
+    direction: direction === 'user' ? 'user' : 'admin',
+    kind: String(kind || 'text').slice(0, 40),
+    title: cleanTitle,
+    body: cleanBody,
+    status: String(status || '').slice(0, 40),
+    relatedFeedbackId: String(relatedFeedbackId || '').slice(0, 120),
+    actionLabel: String(actionLabel || '').slice(0, 100),
+    action: String(action || '').slice(0, 500),
+    time: now,
+    deliveredAt: isOnline(clean) ? now : '',
+    readAt: direction === 'user' ? now : '',
+    bulk: bulk === true,
+    campaignId: String(campaignId || '').slice(0, 120),
+  };
+  state.developerChatMessages.push(item);
+  if (state.developerChatMessages.length > 30000) state.developerChatMessages = state.developerChatMessages.slice(-30000);
+  if (item.direction === 'admin') {
+    sendTo(clean, { type: 'developer_chat_message', item: publicDeveloperChatMessage(item), unreadCount: developerChatUnreadCount(clean) });
+  }
+  return item;
+}
+
+function markDeveloperChatDelivered(id, deliveredAt = new Date().toISOString()) {
+  const clean = normalizeId(id);
+  if (!validId(clean)) return false;
+  let changed = false;
+  for (const item of state.developerChatMessages || []) {
+    if (normalizeId(item.userId || item.to) === clean && item.direction !== 'user' && !item.deliveredAt) {
+      item.deliveredAt = deliveredAt;
+      changed = true;
+    }
+  }
+  if (changed) {
+    for (const campaign of state.developerCampaigns || []) {
+      campaign.deliveredCount = (state.developerChatMessages || []).filter((item) => item.campaignId === campaign.id && item.deliveredAt).length;
+    }
+    saveStateSoon();
+  }
+  return changed;
+}
+
+function pushDeveloperChatState(id, socket) {
+  const clean = normalizeId(id);
+  if (!validId(clean)) return;
+  const now = new Date().toISOString();
+  markDeveloperChatDelivered(clean, now);
+  const messages = developerChatFor(clean, 250);
+  send(socket, { type: 'developer_chat_state', messages, unreadCount: developerChatUnreadCount(clean), serverTime: now });
+}
+
+function pushDeveloperMessages(id, socket) {
+  // Backward-compatible alias for older clients.
+  pushDeveloperChatState(id, socket);
 }
 
 function publicBenchmarkLeaderboard(limit = 100) {
@@ -5410,6 +5533,112 @@ wss.on('connection', (socket, request) => {
       return;
     }
 
+    if (type === 'wallet_spend_reserve') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_spend_reserve');
+      if (!wallet) return;
+      const rate = walletRateLimit(`spend-reserve:${socketIp}:${id}`, 20, 60 * 1000, 5 * 60 * 1000);
+      if (!rate.ok) return send(socket, { type: 'wallet_spend_reserve', ok: false, requestId, code: 'rate_limited', retryAfterSeconds: rate.retryAfterSeconds, message: 'Çok hızlı RFX rezervasyon isteği gönderildi.' });
+      const operationId = String(data.operationId || requestId || '').trim();
+      const action = walletActionKey(data.action);
+      if (!validWalletRequestId(operationId)) return send(socket, { type: 'wallet_spend_reserve', ok: false, requestId, code: 'invalid_operation_id', message: 'Geçerli operationId gerekli.' });
+      const settings = normalizeWalletSettings(state.walletSettings);
+      if (!Object.prototype.hasOwnProperty.call(settings.prices, action)) return send(socket, { type: 'wallet_spend_reserve', ok: false, requestId, code: 'unknown_action', message: 'Bu işlem sunucu fiyat listesinde bulunmuyor.' });
+      const integrityAuth = playIntegrityAuthorizeOperation({
+        id, action: 'wallet_spend', operationId, proofId: data.integrityProofId,
+        payload: { action, metadata: data.metadata && typeof data.metadata === 'object' ? data.metadata : {}, timezoneOffsetMinutes: Number(data.timezoneOffsetMinutes || 0) },
+        ip: socketIp,
+      });
+      if (!integrityAuth.ok) return send(socket, { type: 'wallet_spend_reserve', ok: false, requestId, code: integrityAuth.code, message: integrityAuth.message, wallet: walletPublicSnapshot(id) });
+      state.walletSpendReservations = state.walletSpendReservations && typeof state.walletSpendReservations === 'object' ? state.walletSpendReservations : {};
+      for (const [key, reservation] of Object.entries(state.walletSpendReservations)) {
+        if (!reservation || Date.parse(reservation.expiresAt || '') <= Date.now() || reservation.status !== 'pending') delete state.walletSpendReservations[key];
+      }
+      const existingTransaction = walletFindTransaction(id, operationId);
+      if (existingTransaction) return send(socket, { type: 'wallet_spend_reserve', ok: true, requestId, duplicate: true, committed: true, transaction: existingTransaction, wallet: walletPublicSnapshot(id) });
+      const existingReservation = Object.values(state.walletSpendReservations).find((item) => item && item.userId === id && item.operationId === operationId && item.status === 'pending');
+      if (existingReservation) return send(socket, { type: 'wallet_spend_reserve', ok: true, requestId, duplicate: true, reservation: existingReservation, wallet: walletPublicSnapshot(id) });
+      const effective = walletEffectivePrice(id, action, Math.max(0, Math.round(Number(settings.prices[action] || 0))));
+      const serverBonusSeconds = walletServerBonusSeconds(action);
+      const unlimited = !!isPremiumGranted(id) && settings.premiumUnlimited && serverBonusSeconds <= 0 && action !== 'friends_paid_minute';
+      const reservedForUser = Object.values(state.walletSpendReservations).filter((item) => item && item.userId === id && item.status === 'pending' && Date.parse(item.expiresAt || '') > Date.now()).reduce((sum, item) => sum + Math.max(0, Number(item.price || 0)), 0);
+      const available = Math.max(0, Math.round(Number(wallet.balance || 0))) - reservedForUser;
+      if (!unlimited && effective.price > available) return send(socket, { type: 'wallet_spend_reserve', ok: false, requestId, code: 'insufficient_balance', message: 'Yetersiz RFX bakiyesi.', balance: available, required: effective.price, wallet: walletPublicSnapshot(id) });
+      const reservationId = `reserve-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+      const reservation = {
+        id: reservationId,
+        userId: id,
+        operationId,
+        action,
+        price: effective.price,
+        basePrice: effective.basePrice,
+        discountPercent: effective.discountPercent,
+        discountUntil: effective.discountUntil,
+        unlimited,
+        metadata: data.metadata && typeof data.metadata === 'object' ? normalizeWalletMetadata(data.metadata) : {},
+        timezoneOffsetMinutes: Number(data.timezoneOffsetMinutes || 0),
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
+      };
+      state.walletSpendReservations[reservationId] = reservation;
+      saveStateSoon();
+      send(socket, { type: 'wallet_spend_reserve', ok: true, requestId, reservation, wallet: walletPublicSnapshot(id) });
+      return;
+    }
+
+    if (type === 'wallet_spend_commit') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_spend_commit');
+      if (!wallet) return;
+      const reservationId = String(data.reservationId || '').trim();
+      const reservation = state.walletSpendReservations?.[reservationId];
+      if (!reservation || reservation.userId !== id) return send(socket, { type: 'wallet_spend_commit', ok: false, requestId, code: 'reservation_not_found', message: 'RFX rezervasyonu bulunamadı.', wallet: walletPublicSnapshot(id) });
+      if (reservation.status === 'committed') {
+        const existing = walletFindTransaction(id, reservation.operationId);
+        return send(socket, { type: 'wallet_spend_commit', ok: true, requestId, duplicate: true, transaction: existing, wallet: walletPublicSnapshot(id) });
+      }
+      if (reservation.status !== 'pending' || Date.parse(reservation.expiresAt || '') <= Date.now()) {
+        reservation.status = 'expired';
+        return send(socket, { type: 'wallet_spend_commit', ok: false, requestId, code: 'reservation_expired', message: 'RFX rezervasyonunun süresi doldu.', wallet: walletPublicSnapshot(id) });
+      }
+      try {
+        const spendResult = await walletCommitSpendAction({
+          id,
+          action: reservation.action,
+          operationId: reservation.operationId,
+          price: reservation.price,
+          unlimited: reservation.unlimited === true,
+          metadata: { ...(reservation.metadata || {}), basePrice: reservation.basePrice, discountPercent: reservation.discountPercent, discountUntil: reservation.discountUntil, adConfirmed: true, reservationId },
+          timezoneOffsetMinutes: reservation.timezoneOffsetMinutes,
+        });
+        reservation.status = 'committed';
+        reservation.committedAt = new Date().toISOString();
+        reservation.transactionId = spendResult.transaction?.id || '';
+        saveStateSoon();
+        sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: reservation.unlimited ? 'premium_bypass' : 'rfx_spent', transaction: spendResult.transaction, serverTime: new Date().toISOString() });
+        send(socket, { type: 'wallet_spend_commit', ok: true, requestId, charged: !reservation.unlimited && reservation.price > 0, price: reservation.price, transaction: spendResult.transaction, wallet: walletPublicSnapshot(id), friendUsage: spendResult.friendUsage || undefined, serverTime: new Date().toISOString() });
+      } catch (error) {
+        send(socket, { type: 'wallet_spend_commit', ok: false, requestId, code: error.code || 'wallet_spend_failed', message: error.message, wallet: walletPublicSnapshot(id) });
+      }
+      return;
+    }
+
+    if (type === 'wallet_spend_cancel') {
+      const id = normalizeId(currentId || data.id);
+      const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_spend_cancel');
+      if (!wallet) return;
+      const reservationId = String(data.reservationId || '').trim();
+      const reservation = state.walletSpendReservations?.[reservationId];
+      if (reservation && reservation.userId === id && reservation.status === 'pending') {
+        reservation.status = 'cancelled';
+        reservation.cancelledAt = new Date().toISOString();
+        saveStateSoon();
+      }
+      send(socket, { type: 'wallet_spend_cancel', ok: true, requestId, reservationId, wallet: walletPublicSnapshot(id) });
+      return;
+    }
+
     if (type === 'wallet_spend') {
       const id = normalizeId(currentId || data.id);
       const wallet = walletAuthenticate(socket, socketIp, id, data.walletKey, requestId, 'wallet_spend');
@@ -6149,7 +6378,13 @@ wss.on('connection', (socket, request) => {
         });
         adminAudit('wallet_adjust', { id, amount, reason, transactionId: transaction.id });
         sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: 'admin_adjustment', serverTime: new Date().toISOString() });
-        send(socket, { type: 'admin_wallet_adjust', ok: true, requestId, wallet: walletPublicSnapshot(id), transaction });
+        const chatItem = storeDeveloperChatMessage({
+          userId: id, direction: 'admin', kind: 'account_update',
+          title: amount > 0 ? 'RFX bakiyenize ekleme yapıldı' : 'RFX bakiyeniz güncellendi',
+          body: `${amount > 0 ? '+' : ''}${amount} RFX • ${reason}`,
+        });
+        saveStateSoon();
+        send(socket, { type: 'admin_wallet_adjust', ok: true, requestId, wallet: walletPublicSnapshot(id), transaction, developerChatItem: chatItem ? publicDeveloperChatMessage(chatItem) : null });
       } catch (error) {
         send(socket, { type: 'admin_error', ok: false, requestId, code: error.code || 'wallet_adjust_failed', message: error.message });
       }
@@ -6179,7 +6414,13 @@ wss.on('connection', (socket, request) => {
       walletSecurityEvent(locked ? 'wallet_admin_locked' : 'wallet_admin_unlocked', { id, minutes, reason: wallet.lockReason }, locked ? 'high' : 'info');
       adminAudit('wallet_lock', { id, locked, minutes, reason: wallet.lockReason });
       sendTo(id, { type: 'wallet_changed', wallet: walletPublicSnapshot(id), reason: locked ? 'wallet_locked' : 'wallet_unlocked', serverTime: new Date().toISOString() });
-      send(socket, { type: 'admin_wallet_lock', ok: true, requestId, wallet: walletPublicSnapshot(id) });
+      const chatItem = storeDeveloperChatMessage({
+        userId: id, direction: 'admin', kind: 'security_update',
+        title: locked ? 'RFX cüzdanınız güvenlik kontrolüne alındı' : 'RFX cüzdanınız yeniden açıldı',
+        body: locked ? `${wallet.lockReason}${wallet.lockedUntil ? ` • Bitiş: ${wallet.lockedUntil}` : ''}` : 'Cüzdan kısıtlaması geliştirici tarafından kaldırıldı.',
+      });
+      saveStateSoon();
+      send(socket, { type: 'admin_wallet_lock', ok: true, requestId, wallet: walletPublicSnapshot(id), developerChatItem: chatItem ? publicDeveloperChatMessage(chatItem) : null });
       return;
     }
 
@@ -6432,6 +6673,76 @@ wss.on('connection', (socket, request) => {
       return;
     }
 
+    if (type === 'admin_decide_feedback') {
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
+      const id = String(data.id || '').trim();
+      const decision = String(data.decision || '').trim();
+      const reply = String(data.reply || '').trim().slice(0, 2500);
+      const item = (state.feedback || []).find((fb) => fb.id === id);
+      if (!item) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Feedback not found' });
+      if (item.category !== 'feedback') return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Only product feedback can use this decision flow.' });
+
+      const decisionMap = {
+        reward: { status: 'resolved', rewardStatus: 'rewarded' },
+        approve: { status: 'resolved', rewardStatus: 'approved_no_reward' },
+        more_info: { status: 'reviewing', rewardStatus: 'more_info' },
+        reject: { status: 'closed', rewardStatus: 'rejected' },
+      };
+      const selected = decisionMap[decision];
+      if (!selected) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Invalid feedback decision.' });
+
+      let rewardTransaction = null;
+      if (decision === 'reward') {
+        if (item.rewardStatus === 'rewarded' || item.rewardedAt) {
+          return send(socket, { type: 'admin_error', ok: false, requestId, message: 'This feedback was already rewarded.' });
+        }
+        const walletRequestId = `feedback-reward:${item.id}`;
+        rewardTransaction = walletFindTransaction(item.from, walletRequestId);
+        if (!rewardTransaction) {
+          rewardTransaction = await walletCommitDelta({
+            id: item.from,
+            delta: 50,
+            type: 'FEEDBACK_REWARD',
+            action: 'feedback_reward',
+            requestId: walletRequestId,
+            source: 'admin_feedback',
+            metadata: { feedbackId: item.id, title: item.title },
+          });
+        }
+        item.rewardedAt = rewardTransaction.createdAt || new Date().toISOString();
+        item.rewardAmount = 50;
+        item.rewardTransactionId = rewardTransaction.id || '';
+      }
+
+      item.status = selected.status;
+      item.rewardStatus = selected.rewardStatus;
+      item.reply = reply;
+      item.updatedAt = new Date().toISOString();
+      const body = decision === 'reward'
+        ? (reply || 'Geri bildiriminiz onaylandı. RELAXFPS’i geliştirmemize yardımcı olduğunuz için hesabınıza 50 RFX eklendi.')
+        : decision === 'approve'
+          ? (reply || 'Geri bildiriminiz incelendi ve onaylandı.')
+          : decision === 'more_info'
+            ? (reply || 'Geri bildiriminiz için daha fazla bilgi gerekiyor. Destek Merkezi üzerinden ayrıntı ekleyebilirsiniz.')
+            : (reply || 'Geri bildiriminiz incelendi ancak ödül koşullarını karşılamadı.');
+      const chatItem = validId(item.from) ? storeDeveloperChatMessage({
+        userId: item.from,
+        direction: 'admin',
+        kind: decision === 'reward' ? 'feedback_reward' : 'feedback_result',
+        title: decision === 'reward' ? 'Geri bildiriminiz onaylandı • +50 RFX' : 'Geri bildirim sonucu',
+        body,
+        status: item.status,
+        relatedFeedbackId: item.id,
+        actionLabel: 'Geri bildirimi görüntüle',
+        action: `support:${item.id}`,
+      }) : null;
+      if (validId(item.from)) sendTo(item.from, { type: 'feedback_reply', item, developerChatItem: chatItem ? publicDeveloperChatMessage(chatItem) : null });
+      adminAudit('decide_feedback', { id, decision, rewarded: decision === 'reward' });
+      saveStateSoon();
+      send(socket, { type: 'admin_decide_feedback', ok: true, requestId, item, rewardTransaction, developerChatItem: chatItem ? publicDeveloperChatMessage(chatItem) : null });
+      return;
+    }
+
     if (type === 'admin_update_feedback') {
       if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const id = String(data.id || '').trim();
@@ -6440,10 +6751,25 @@ wss.on('connection', (socket, request) => {
       item.status = String(data.status || item.status || 'new').slice(0, 40);
       item.reply = String(data.reply || '').slice(0, 2500);
       item.updatedAt = new Date().toISOString();
+      let chatItem = null;
+      if (validId(item.from)) {
+        const statusLabels = { new: 'Yeni', reviewing: 'İnceleniyor', resolved: 'Çözüldü', closed: 'Kapalı' };
+        chatItem = storeDeveloperChatMessage({
+          userId: item.from,
+          direction: 'admin',
+          kind: 'support_reply',
+          title: `Destek talebi: ${String(item.title || 'Talebiniz').slice(0, 100)}`,
+          body: item.reply || `Talebinizin durumu ${statusLabels[item.status] || item.status} olarak güncellendi.`,
+          status: item.status,
+          relatedFeedbackId: item.id,
+          actionLabel: 'Destek talebini görüntüle',
+          action: `support:${item.id}`,
+        });
+        sendTo(item.from, { type: 'feedback_reply', item, developerChatItem: chatItem ? publicDeveloperChatMessage(chatItem) : null });
+      }
       adminAudit('update_feedback', { id, status: item.status });
       saveStateSoon();
-      if (validId(item.from)) sendTo(item.from, { type: 'feedback_reply', item });
-      send(socket, { type: 'admin_update_feedback', ok: true, requestId, item });
+      send(socket, { type: 'admin_update_feedback', ok: true, requestId, item, developerChatItem: chatItem ? publicDeveloperChatMessage(chatItem) : null });
       return;
     }
 
@@ -6482,9 +6808,16 @@ wss.on('connection', (socket, request) => {
         state.premiumUsers[id] = { id, months, until, time: new Date().toISOString(), source: 'developer_panel' };
         sendTo(id, { type: 'premium_granted', grant: state.premiumUsers[id] });
       }
+      const premiumChatItem = storeDeveloperChatMessage({
+        userId: id, direction: 'admin', kind: 'account_update',
+        title: months > 0 ? 'Premium erişiminiz etkinleştirildi' : 'Premium erişiminiz sona erdi',
+        body: months > 0
+          ? `${months} aylık Premium erişim geliştirici tarafından tanımlandı. Bitiş: ${state.premiumUsers[id].until}`
+          : 'Geliştirici tarafından tanımlanan Premium erişim kaldırıldı.',
+      });
       adminAudit('set_premium', { id, months });
       saveStateSoon();
-      send(socket, { type: 'admin_set_premium', ok: true, requestId, id, premium: !!state.premiumUsers[id], grant: state.premiumUsers[id] || null });
+      send(socket, { type: 'admin_set_premium', ok: true, requestId, id, premium: !!state.premiumUsers[id], grant: state.premiumUsers[id] || null, developerChatItem: premiumChatItem ? publicDeveloperChatMessage(premiumChatItem) : null });
       return;
     }
 
@@ -6492,44 +6825,89 @@ wss.on('connection', (socket, request) => {
       if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const to = normalizeId(data.to);
       if (!validId(to)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Valid RelaxFPS ID required' });
-      const item = {
-        id: `devmsg-${Date.now()}-${Math.floor(Math.random() * 99999)}`,
-        to,
-        title: String(data.title || 'Geliştiriciden mesajınız var').slice(0, 120),
-        body: String(data.body || '').slice(0, 2500),
-        time: new Date().toISOString(),
-        read: false,
-      };
-      state.developerMessages = state.developerMessages || [];
-      state.developerMessages.push(item);
-      if (state.developerMessages.length > 1000) state.developerMessages = state.developerMessages.slice(-1000);
+      const item = storeDeveloperChatMessage({
+        userId: to,
+        direction: 'admin',
+        kind: String(data.kind || 'text').slice(0, 40),
+        title: String(data.title || 'Geliştiriciden mesajınız var').slice(0, 160),
+        body: String(data.body || '').slice(0, 4000),
+        actionLabel: String(data.actionLabel || '').slice(0, 100),
+        action: String(data.action || '').slice(0, 500),
+      });
+      if (!item || (!item.title && !item.body)) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Message content required' });
       adminAudit('send_developer_message', { to, title: item.title });
       saveStateSoon();
-      sendTo(to, { type: 'developer_message', ...item });
-      send(socket, { type: 'admin_send_developer_message', ok: true, requestId, item });
+      send(socket, { type: 'admin_send_developer_message', ok: true, requestId, item: publicDeveloperChatMessage(item) });
       return;
     }
-
 
     if (type === 'admin_send_bulk_developer_message') {
       if (!requireAdmin(socket, adminSessionToken, requestId)) return;
       const toAll = data.toAll === true;
       const ids = Array.isArray(data.ids) ? data.ids.map(normalizeId).filter(validId) : [];
-      const targets = toAll ? Object.keys(state.profiles || {}) : Array.from(new Set(ids));
-      const title = String(data.title || 'Geliştiriciden mesajınız var').slice(0, 120);
-      const body = String(data.body || '').slice(0, 2500);
-      state.developerMessages = state.developerMessages || [];
+      let targets = toAll ? Object.keys(state.profiles || {}).map(normalizeId).filter(validId) : Array.from(new Set(ids));
+      if (data.premiumOnly === true) targets = targets.filter((id) => !!isPremiumGranted(id));
+      if (data.nonPremiumOnly === true) targets = targets.filter((id) => !isPremiumGranted(id));
+      const language = String(data.language || '').trim().toLowerCase();
+      if (language) targets = targets.filter((id) => String(state.profiles?.[id]?.language || '').toLowerCase() === language);
+      const activeDays = Math.max(0, Math.min(Number(data.activeDays || 0), 3650));
+      if (activeDays > 0) {
+        const cutoff = Date.now() - activeDays * 24 * 60 * 60 * 1000;
+        targets = targets.filter((id) => Date.parse(state.profiles?.[id]?.lastSeen || '') >= cutoff);
+      }
+      if (!targets.length) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'No matching users selected' });
+      const title = String(data.title || 'Geliştiriciden mesajınız var').slice(0, 160);
+      const body = String(data.body || '').slice(0, 4000);
+      if (!title && !body) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Message content required' });
+      const campaignId = `campaign-${Date.now()}-${crypto.randomBytes(5).toString('hex')}`;
+      const campaign = {
+        id: campaignId,
+        title,
+        body,
+        targetCount: targets.length,
+        deliveredCount: 0,
+        readCount: 0,
+        filters: { toAll, premiumOnly: data.premiumOnly === true, nonPremiumOnly: data.nonPremiumOnly === true, language, activeDays },
+        createdAt: new Date().toISOString(),
+      };
+      state.developerCampaigns = Array.isArray(state.developerCampaigns) ? state.developerCampaigns : [];
+      state.developerCampaigns.push(campaign);
+      if (state.developerCampaigns.length > 1000) state.developerCampaigns = state.developerCampaigns.slice(-1000);
       const items = [];
       for (const to of targets) {
-        const item = { id: `devmsg-${Date.now()}-${Math.floor(Math.random() * 99999)}`, to, title, body, time: new Date().toISOString(), read: false, bulk: true };
-        state.developerMessages.push(item);
-        items.push(item);
-        sendTo(to, { type: 'developer_message', ...item });
+        const item = storeDeveloperChatMessage({
+          userId: to,
+          direction: 'admin',
+          kind: String(data.kind || 'broadcast').slice(0, 40),
+          title,
+          body,
+          actionLabel: String(data.actionLabel || '').slice(0, 100),
+          action: String(data.action || '').slice(0, 500),
+          bulk: true,
+          campaignId,
+        });
+        if (item) items.push(item);
       }
-      if (state.developerMessages.length > 2000) state.developerMessages = state.developerMessages.slice(-2000);
-      adminAudit('send_bulk_developer_message', { count: items.length, toAll });
+      campaign.deliveredCount = items.filter((item) => item.deliveredAt).length;
+      adminAudit('send_bulk_developer_message', { count: items.length, toAll, campaignId });
       saveStateSoon();
-      send(socket, { type: 'admin_send_bulk_developer_message', ok: true, requestId, count: items.length });
+      send(socket, { type: 'admin_send_bulk_developer_message', ok: true, requestId, count: items.length, campaign });
+      return;
+    }
+
+    if (type === 'admin_delete_developer_message') {
+      if (!requireAdmin(socket, adminSessionToken, requestId)) return;
+      const id = String(data.id || '').trim();
+      const item = (state.developerChatMessages || []).find((entry) => entry.id === id);
+      if (!item) return send(socket, { type: 'admin_error', ok: false, requestId, message: 'Developer message not found' });
+      item.deleted = true;
+      item.title = 'Mesaj kaldırıldı';
+      item.body = 'Bu mesaj RELAXFPS yöneticisi tarafından kaldırıldı.';
+      item.updatedAt = new Date().toISOString();
+      sendTo(item.userId, { type: 'developer_chat_message_deleted', id: item.id, item: publicDeveloperChatMessage(item) });
+      adminAudit('delete_developer_message', { id, userId: item.userId });
+      saveStateSoon();
+      send(socket, { type: 'admin_delete_developer_message', ok: true, requestId, item: publicDeveloperChatMessage(item) });
       return;
     }
 
@@ -6672,6 +7050,42 @@ wss.on('connection', (socket, request) => {
       return;
     }
 
+    if (type === 'developer_chat_history') {
+      const id = normalizeId(currentId || data.id);
+      if (!validId(id) || !currentSocketIdentityMatches(socket, id)) {
+        send(socket, { type: 'developer_chat_history', ok: false, requestId, message: 'Registered RelaxFPS ID required.' });
+        return;
+      }
+      const historyTime = new Date().toISOString();
+      markDeveloperChatDelivered(id, historyTime);
+      send(socket, { type: 'developer_chat_history', ok: true, requestId, messages: developerChatFor(id, data.limit), unreadCount: developerChatUnreadCount(id), serverTime: historyTime });
+      return;
+    }
+
+    if (type === 'developer_chat_mark_read') {
+      const id = normalizeId(currentId || data.id);
+      if (!validId(id) || !currentSocketIdentityMatches(socket, id)) {
+        send(socket, { type: 'developer_chat_mark_read', ok: false, requestId, message: 'Registered RelaxFPS ID required.' });
+        return;
+      }
+      const now = new Date().toISOString();
+      markDeveloperChatDelivered(id, now);
+      let updated = 0;
+      for (const item of state.developerChatMessages || []) {
+        if (normalizeId(item.userId || item.to) === id && item.direction !== 'user' && !item.readAt) {
+          item.readAt = now;
+          updated += 1;
+        }
+      }
+      for (const campaign of state.developerCampaigns || []) {
+        campaign.readCount = (state.developerChatMessages || []).filter((item) => item.campaignId === campaign.id && item.readAt).length;
+        campaign.deliveredCount = (state.developerChatMessages || []).filter((item) => item.campaignId === campaign.id && item.deliveredAt).length;
+      }
+      if (updated) saveStateSoon();
+      send(socket, { type: 'developer_chat_mark_read', ok: true, requestId, updated, unreadCount: developerChatUnreadCount(id), serverTime: now });
+      return;
+    }
+
     if (type === 'feedback_list') {
       const from = normalizeId(currentId);
       if (!validId(from) || !currentSocketIdentityMatches(socket, from)) {
@@ -6695,8 +7109,14 @@ wss.on('connection', (socket, request) => {
           priority: item.priority || 'normal',
           time: item.time || '',
           updatedAt: item.updatedAt || item.time || '',
+          rewardEligible: item.rewardEligible === true,
+          rewardStatus: item.rewardStatus || 'not_applicable',
+          rewardAmount: Number(item.rewardAmount || 0),
+          rewardedAt: item.rewardedAt || '',
         }));
-      send(socket, { type: 'feedback_list', ok: true, requestId, items });
+      const monthKey = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 7);
+      const feedbackUsed = (state.feedback || []).filter((item) => normalizeId(item.from) === from && item.category === 'feedback' && String(item.feedbackMonthKey || '').trim() === monthKey).length;
+      send(socket, { type: 'feedback_list', ok: true, requestId, items, monthlyFeedback: { monthKey, used: feedbackUsed, limit: 5, remaining: Math.max(0, 5 - feedbackUsed) } });
       return;
     }
 
@@ -6707,7 +7127,7 @@ wss.on('connection', (socket, request) => {
         return;
       }
 
-      const categories = new Set(['technical', 'payment', 'server', 'other']);
+      const categories = new Set(['technical', 'payment', 'server', 'feedback', 'other']);
       const category = categories.has(String(data.category || '').trim()) ? String(data.category).trim() : 'technical';
       const email = String(data.email || '').trim().slice(0, 160);
       const title = String(data.title || '').trim().slice(0, 120);
@@ -6717,9 +7137,23 @@ wss.on('connection', (socket, request) => {
       const attachmentMime = String(data.attachmentMime || '').trim().slice(0, 80);
       const hasAttachment = attachmentBase64.length > 0;
 
-      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || title.length < 3 || body.length < 10) {
-        send(socket, { type: 'feedback_saved', ok: false, requestId, message: 'Valid email, title and detailed message are required.' });
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || title.length < 3 || body.length < (category === 'feedback' ? 20 : 10)) {
+        send(socket, { type: 'feedback_saved', ok: false, requestId, message: category === 'feedback' ? 'Geri bildirim en az 20 karakter olmalıdır.' : 'Valid email, title and detailed message are required.' });
         return;
+      }
+      const feedbackMonthKey = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 7);
+      if (category === 'feedback') {
+        const monthItems = (state.feedback || []).filter((entry) => normalizeId(entry.from) === from && entry.category === 'feedback' && String(entry.feedbackMonthKey || '') === feedbackMonthKey);
+        if (monthItems.length >= 5) {
+          send(socket, { type: 'feedback_saved', ok: false, requestId, message: 'Bu ay için 5 geri bildirim hakkınızı kullandınız.', code: 'monthly_feedback_limit' });
+          return;
+        }
+        const normalizedBody = body.toLocaleLowerCase('tr-TR').replace(/\s+/g, ' ').trim();
+        const duplicate = monthItems.some((entry) => String(entry.body || '').toLocaleLowerCase('tr-TR').replace(/\s+/g, ' ').trim() === normalizedBody);
+        if (duplicate) {
+          send(socket, { type: 'feedback_saved', ok: false, requestId, message: 'Aynı geri bildirim bu ay daha önce gönderildi.', code: 'duplicate_feedback' });
+          return;
+        }
       }
       if (hasAttachment && (attachmentBase64.length > 500000 || !/^image\/(jpeg|png|webp)$/i.test(attachmentMime))) {
         send(socket, { type: 'feedback_saved', ok: false, requestId, message: 'Attachment must be a JPEG, PNG or WEBP image under the size limit.' });
@@ -6733,6 +7167,11 @@ wss.on('connection', (socket, request) => {
         title,
         category,
         body,
+        feedbackMonthKey: category === 'feedback' ? feedbackMonthKey : '',
+        rewardEligible: category === 'feedback',
+        rewardStatus: category === 'feedback' ? 'pending' : 'not_applicable',
+        rewardAmount: category === 'feedback' ? 50 : 0,
+        rewardedAt: '',
         attachmentBase64: hasAttachment ? attachmentBase64 : '',
         attachmentName: hasAttachment ? (attachmentName || 'support-image') : '',
         attachmentMime: hasAttachment ? attachmentMime : '',
@@ -6745,6 +7184,17 @@ wss.on('connection', (socket, request) => {
       state.feedback = state.feedback || [];
       state.feedback.push(item);
       if (state.feedback.length > 500) state.feedback = state.feedback.slice(-500);
+      const developerChatItem = storeDeveloperChatMessage({
+        userId: from,
+        direction: 'user',
+        kind: 'support_request',
+        title: `Gönderdiğiniz destek talebi: ${item.title}`,
+        body: item.body,
+        status: item.status,
+        relatedFeedbackId: item.id,
+        actionLabel: 'Destek talebini görüntüle',
+        action: `support:${item.id}`,
+      });
       const attachmentCutoff = Math.max(0, state.feedback.length - 12);
       for (let index = 0; index < attachmentCutoff; index += 1) {
         if (state.feedback[index]?.attachmentBase64) state.feedback[index].attachmentBase64 = '';
@@ -6766,8 +7216,36 @@ wss.on('connection', (socket, request) => {
           reply: item.reply,
           priority: item.priority,
           time: item.time,
+          rewardEligible: item.rewardEligible,
+          rewardStatus: item.rewardStatus,
+          rewardAmount: item.rewardAmount,
         },
+        monthlyFeedback: category === 'feedback' ? { monthKey: feedbackMonthKey, used: (state.feedback || []).filter((entry) => normalizeId(entry.from) === from && entry.category === 'feedback' && String(entry.feedbackMonthKey || '') === feedbackMonthKey).length, limit: 5, remaining: Math.max(0, 5 - (state.feedback || []).filter((entry) => normalizeId(entry.from) === from && entry.category === 'feedback' && String(entry.feedbackMonthKey || '') === feedbackMonthKey).length) } : null,
+        developerChatItem: developerChatItem ? publicDeveloperChatMessage(developerChatItem) : null,
       });
+      return;
+    }
+
+    if (type === 'developer_chat_register') {
+      const id = normalizeId(data.id);
+      if (!validId(id)) {
+        send(socket, { type: 'developer_chat_registered', ok: false, requestId, message: 'Invalid RelaxFPS ID' });
+        return;
+      }
+      const ban = isBanned(id);
+      if (ban) {
+        send(socket, { type: 'banned', ban, message: ban.reason || 'This RelaxFPS ID is banned.' });
+        return;
+      }
+      currentId = id;
+      setCurrentSocketIdentity(socket, id);
+      ensureProfile(id, '');
+      state.profiles[id].appVersion = String(data.appVersion || state.profiles[id].appVersion || '').slice(0, 80);
+      state.profiles[id].language = String(data.language || state.profiles[id].language || '').slice(0, 20);
+      state.profiles[id].lastSeen = new Date().toISOString();
+      send(socket, { type: 'developer_chat_registered', ok: true, requestId, id, serverTime: new Date().toISOString() });
+      pushDeveloperChatState(id, socket);
+      saveStateSoon();
       return;
     }
 
@@ -6815,7 +7293,7 @@ wss.on('connection', (socket, request) => {
 
       if (wasOffline) broadcastPresence(id, true);
       flushQueue(id);
-      pushDeveloperMessages(id, socket);
+      pushDeveloperChatState(id, socket);
       console.log(`[REGISTER] ${id} (${socketsFor(id).size} socket(s))`);
       return;
     }
@@ -7442,7 +7920,7 @@ async function bootstrapServer() {
   }
 
   httpServer.listen(PORT, () => {
-    console.log(`RelaxFPS Friends Server v6.11.0-power-tools-ads-announcements running on ws://0.0.0.0:${PORT}`);
+    console.log(`RelaxFPS Friends Server v6.13.0-ui-news-feedback-stability running on ws://0.0.0.0:${PORT}`);
     console.log(`RELAXFPS Admin Studio: http://0.0.0.0:${PORT}/admin`);
     console.log(`[PERSISTENCE] ${SUPABASE_CONFIGURED ? `Supabase active, state=${SUPABASE_STATE_ID}, revision=${supabaseStateRevision}` : 'local ephemeral mode'}`);
     if (ADMIN_PASSWORD.length < 12) console.warn('[SECURITY] RELAXFPS_ADMIN_PASSWORD is missing or shorter than 12 characters. Admin login is disabled.');

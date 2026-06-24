@@ -1,7 +1,7 @@
 {
   "name": "relaxfps-friends-server",
-  "version": "6.11.0",
-  "description": "RELAXFPS backend with secure RFX economy, device identity reset, internal announcements, premium unlimited usage records, advanced tools, centralized ad transitions, Friends minutes, Google Play verification, Play Integrity, and Supabase persistence",
+  "version": "6.13.0",
+  "description": "RELAXFPS backend with stable preloaded ad-gated RFX tools, monthly feedback rewards, developer chat, secure wallet economy, announcements and device identity.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

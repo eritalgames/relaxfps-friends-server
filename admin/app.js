@@ -21,6 +21,8 @@ let currentPage = 'overview';
 let contentTab = 'announcements';
 let selectedUserId = '';
 let selectedWalletId = '';
+let selectedChatUserId = '';
+const selectedChatIds = new Set();
 let pending = new Map();
 let reconnectTimer = null;
 let toastTimer = null;
@@ -33,6 +35,7 @@ const titles = {
   overview: ['YÖNETİM MERKEZİ', 'Genel Bakış'],
   content: ['YAYIN VE İÇERİK', 'İçerik Yönetimi'],
   users: ['KULLANICI MERKEZİ', 'Kullanıcılar'],
+  chat: ['RESMÎ MESAJ MERKEZİ', 'Kullanıcılarla Sohbet'],
   wallet: ['RFX TOKEN MERKEZİ', 'RFX'],
   'app-control': ['UZAKTAN YÖNETİM', 'Uygulama Kontrolü'],
   feedback: ['DESTEK MERKEZİ', 'Geri Bildirim'],
@@ -264,6 +267,7 @@ function renderPage() {
     overview: renderOverview,
     content: renderContent,
     users: renderUsers,
+    chat: renderDeveloperChat,
     wallet: renderWallet,
     'app-control': renderAppControl,
     feedback: renderFeedback,
@@ -728,15 +732,146 @@ function renderAppControl() {
   $('#appSettingsForm').addEventListener('submit', async e=>{e.preventDefault();const b=e.submitter;setBusy(b,true);try{const payload={};for(const [k] of toggles)payload[k]=$(`#setting_${k}`).checked;Object.assign(payload,{maintenanceMessage:$('#maintenanceMessage').value.trim(),maintenanceUntil:$('#maintenanceUntil').value.trim(),minimumVersion:$('#minimumVersion').value.trim(),latestVersion:$('#latestVersion').value.trim(),playStoreUrl:$('#playStoreUrl').value.trim(),updateMessage:$('#updateMessage').value.trim(),freeFriendMinutes:Number($('#freeFriendMinutes').value||15),premiumFriendMinutes:Number($('#premiumFriendMinutes').value||60),appLockFailLimit:Number($('#appLockFailLimit').value||3),appLockLockMinutes:Number($('#appLockLockMinutes').value||2)});await request('admin_update_app_settings',payload);await refreshSnapshot();toast('Uygulama ayarları kaydedildi.');}catch(err){toast(err.message,true)}finally{setBusy(b,false)}});
 }
 
+
+function renderDeveloperChat() {
+  const users = snapshot.users || [];
+  if (!selectedChatUserId && users.length) selectedChatUserId = users[0].id;
+  const selectedUser = users.find(user => user.id === selectedChatUserId) || null;
+  const allMessages = snapshot.developerChatMessages || [];
+  const messages = selectedUser
+    ? allMessages.filter(item => String(item.userId || item.to || '').toUpperCase() === selectedUser.id).slice().sort((a,b)=>new Date(a.time||0)-new Date(b.time||0))
+    : [];
+  const campaigns = snapshot.developerCampaigns || [];
+  const rows = users.map(user => {
+    const unread = allMessages.filter(item => String(item.userId||'').toUpperCase()===user.id && item.direction!=='user' && !item.readAt).length;
+    const checked = selectedChatIds.has(user.id) ? 'checked' : '';
+    const search = `${user.id} ${user.name||''} ${user.language||''}`.toLowerCase();
+    return `<div class="chat-user-row ${user.id===selectedChatUserId?'active':''}" data-chat-row="${escapeHtml(user.id)}" data-search="${escapeHtml(search)}">
+      <input type="checkbox" data-chat-check="${escapeHtml(user.id)}" ${checked} aria-label="Kullanıcıyı seç">
+      <button data-chat-user="${escapeHtml(user.id)}"><span><b>${escapeHtml(user.name||'RelaxFPS User')}</b><small class="code">${escapeHtml(user.id)}</small></span><span>${user.online?'<span class="badge ok">ONLINE</span>':''}${user.premium?'<span class="badge warn">PREMIUM</span>':''}${unread?`<span class="badge bad">${unread}</span>`:''}</span></button>
+    </div>`;
+  }).join('');
+  const bubbles = messages.map(item => {
+    const mine = item.direction !== 'user';
+    return `<div class="admin-chat-bubble ${mine?'admin':'user'}" data-dev-message="${escapeHtml(item.id)}">
+      <div class="chat-meta"><b>${mine?'RELAXFPS Geliştirici':'Kullanıcı / Destek'}</b><span>${escapeHtml(fmtDate(item.time))}</span></div>
+      ${item.title?`<strong>${escapeHtml(item.title)}</strong>`:''}
+      ${item.body?`<p>${escapeHtml(item.body)}</p>`:''}
+      ${item.status?`<span class="badge">${escapeHtml(item.status)}</span>`:''}
+      ${item.deleted?'<span class="badge bad">KALDIRILDI</span>':''}
+      ${mine&&!item.deleted?`<button class="danger ghost compact" data-delete-dev="${escapeHtml(item.id)}">Mesajı kaldır</button>`:''}
+    </div>`;
+  }).join('') || '<div class="empty">Bu kullanıcıyla henüz resmî mesaj yok.</div>';
+  const campaignRows = campaigns.slice(0,20).map(c=>`<div class="list-item"><div class="list-item-head"><b>${escapeHtml(c.title||'Toplu mesaj')}</b><span>${escapeHtml(fmtDate(c.createdAt))}</span></div><p>${escapeHtml(c.body||'')}</p><div class="actions"><span class="badge">HEDEF ${Number(c.targetCount||0)}</span><span class="badge ok">TESLİM ${Number(c.deliveredCount||0)}</span><span class="badge warn">OKUNDU ${Number(c.readCount||0)}</span></div></div>`).join('') || '<div class="empty">Toplu mesaj geçmişi yok.</div>';
+  pageContent.innerHTML = `
+    <div class="section-head"><div><h3>RELAXFPS Geliştirici sohbeti</h3><p>Destek yanıtları, bireysel ve toplu resmî mesajlar tek konuşmada birleşir.</p></div><input id="chatUserSearch" class="search" placeholder="ID, ad veya dil ara"></div>
+    <div class="developer-chat-layout">
+      <section class="card chat-user-list">
+        <div class="actions"><button id="selectVisibleChat" class="ghost">Görünenleri seç</button><button id="clearChatSelection" class="ghost">Seçimi temizle</button></div>
+        <div id="chatUserRows">${rows||'<div class="empty">Kullanıcı yok.</div>'}</div>
+      </section>
+      <section class="card chat-conversation">
+        <div class="chat-header"><div><h3>${escapeHtml(selectedUser?.name||'Kullanıcı seç')}</h3><p class="code">${escapeHtml(selectedUser?.id||'')}</p></div><span class="badge ok">TEK YÖNLÜ RESMÎ KANAL</span></div>
+        <div id="adminChatMessages" class="admin-chat-messages">${bubbles}</div>
+        <form id="individualChatForm" class="form-grid chat-composer">
+          ${fieldValue('chatTitle','Başlık','Geliştiriciden mesajınız var','text','full')}
+          ${area('chatBody','Mesaj',true,'full')}
+          ${field('chatActionLabel','Buton yazısı (isteğe bağlı)','text','Destek talebini aç')}
+          ${field('chatAction','Buton işlemi / bağlantı','text','support veya https://...')}
+          <button class="primary full" type="submit" ${selectedUser?'':'disabled'}>Kullanıcıya gönder</button>
+        </form>
+      </section>
+      <section class="card bulk-chat-panel">
+        <h3>Toplu mesaj</h3>
+        <p class="muted"><b id="selectedChatCount">${selectedChatIds.size}</b> kullanıcı seçili. İstersen tüm kullanıcıları hedefle.</p>
+        <form id="bulkChatForm" class="form-grid">
+          <label class="check-row full"><input id="bulkToAll" type="checkbox"><span>Tüm kullanıcılar</span></label>
+          <label class="check-row"><input id="bulkPremium" type="checkbox"><span>Yalnız Premium</span></label>
+          <label class="check-row"><input id="bulkNonPremium" type="checkbox"><span>Yalnız Premium olmayan</span></label>
+          ${field('bulkLanguage','Dil filtresi','text','tr / en')}
+          ${fieldValue('bulkActiveDays','Son kaç günde aktif','0','number')}
+          ${fieldValue('bulkTitle','Başlık','RELAXFPS duyurusu','text','full')}
+          ${area('bulkBody','Toplu mesaj',true,'full')}
+          ${field('bulkActionLabel','Buton yazısı','text','Detayları aç')}
+          ${field('bulkAction','Buton işlemi / bağlantı','text','support veya https://...')}
+          <button class="danger full" type="submit">Toplu mesajı gönder</button>
+        </form>
+        <h3 style="margin-top:24px">Son toplu gönderimler</h3><div class="list campaign-list">${campaignRows}</div>
+      </section>
+    </div>`;
+
+  $('#chatUserSearch').addEventListener('input', event => {
+    const query = event.target.value.toLowerCase();
+    $$('#chatUserRows [data-chat-row]').forEach(row => row.classList.toggle('hidden', !row.dataset.search.includes(query)));
+  });
+  $('#chatUserRows').addEventListener('click', event => {
+    const check = event.target.closest('[data-chat-check]');
+    if (check) {
+      check.checked ? selectedChatIds.add(check.dataset.chatCheck) : selectedChatIds.delete(check.dataset.chatCheck);
+      $('#selectedChatCount').textContent = selectedChatIds.size;
+      return;
+    }
+    const button = event.target.closest('[data-chat-user]');
+    if (!button) return;
+    selectedChatUserId = button.dataset.chatUser;
+    renderDeveloperChat();
+  });
+  $('#selectVisibleChat').addEventListener('click', () => {
+    $$('#chatUserRows [data-chat-row]:not(.hidden)').forEach(row => selectedChatIds.add(row.dataset.chatRow));
+    renderDeveloperChat();
+  });
+  $('#clearChatSelection').addEventListener('click', () => { selectedChatIds.clear(); renderDeveloperChat(); });
+  $('#individualChatForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!selectedChatUserId) return;
+    const button = event.submitter; setBusy(button,true,'Gönderiliyor…');
+    try {
+      await request('admin_send_developer_message',{to:selectedChatUserId,title:$('#chatTitle').value.trim(),body:$('#chatBody').value.trim(),actionLabel:$('#chatActionLabel').value.trim(),action:$('#chatAction').value.trim()});
+      await refreshSnapshot(); toast('Resmî mesaj gönderildi.');
+    } catch(error){toast(error.message,true)} finally {setBusy(button,false)}
+  });
+  $('#adminChatMessages').addEventListener('click', event => {
+    const button = event.target.closest('[data-delete-dev]'); if(!button)return;
+    confirmAction('Mesajı kaldır','Bu mesaj kullanıcının resmî sohbetinde kaldırılmış olarak işaretlensin mi?',async()=>{await request('admin_delete_developer_message',{id:button.dataset.deleteDev});await refreshSnapshot();toast('Mesaj kaldırıldı.');});
+  });
+  $('#bulkChatForm').addEventListener('submit', event => {
+    event.preventDefault();
+    const toAll=$('#bulkToAll').checked;
+    if(!toAll && !selectedChatIds.size){toast('En az bir kullanıcı seç veya Tüm kullanıcılar seçeneğini aç.',true);return;}
+    if($('#bulkPremium').checked && $('#bulkNonPremium').checked){toast('Premium ve Premium olmayan filtreleri aynı anda seçilemez.',true);return;}
+    const estimate=toAll?'tüm uygun kullanıcılara':`${selectedChatIds.size} seçili kullanıcıya`;
+    confirmAction('Toplu mesajı onayla',`Bu resmî mesaj ${estimate} gönderilecek. İşlem geri alınamaz.`,async()=>{
+      await request('admin_send_bulk_developer_message',{toAll,ids:[...selectedChatIds],premiumOnly:$('#bulkPremium').checked,nonPremiumOnly:$('#bulkNonPremium').checked,language:$('#bulkLanguage').value.trim(),activeDays:Number($('#bulkActiveDays').value||0),title:$('#bulkTitle').value.trim(),body:$('#bulkBody').value.trim(),actionLabel:$('#bulkActionLabel').value.trim(),action:$('#bulkAction').value.trim()},30000);
+      await refreshSnapshot();toast('Toplu resmî mesaj gönderildi.');
+    });
+  });
+  requestAnimationFrame(()=>{const box=$('#adminChatMessages');if(box)box.scrollTop=box.scrollHeight;});
+}
+
 function renderFeedback() {
   const items = snapshot.feedback || [];
   pageContent.innerHTML = `<div class="section-head"><div><h3>Kullanıcı geri bildirimleri</h3><p>${items.length} kayıt</p></div></div><div id="feedbackList" class="list">${items.map(feedbackItem).join('')||'<div class="card empty">Geri bildirim yok.</div>'}</div>`;
-  $('#feedbackList').addEventListener('click', async e=>{const b=e.target.closest('button[data-feedback]');if(!b)return;const id=b.dataset.feedback;const card=b.closest('[data-feedback-card]');try{await request('admin_update_feedback',{id,status:card.querySelector('select').value,reply:card.querySelector('textarea').value.trim()});await refreshSnapshot();toast('Geri bildirim güncellendi.');}catch(err){toast(err.message,true)}});
+  $('#feedbackList').addEventListener('click', async e=>{
+    const b=e.target.closest('button[data-feedback],button[data-feedback-decision]');if(!b)return;
+    const card=b.closest('[data-feedback-card]');const id=card?.dataset.feedbackCard||b.dataset.feedback;
+    try{
+      if(b.dataset.feedbackDecision){
+        await request('admin_decide_feedback',{id,decision:b.dataset.feedbackDecision,reply:card.querySelector('textarea').value.trim()});
+        toast(b.dataset.feedbackDecision==='reward'?'50 RFX ödülü gönderildi.':'Geri bildirim kararı gönderildi.');
+      }else{
+        await request('admin_update_feedback',{id,status:card.querySelector('select').value,reply:card.querySelector('textarea').value.trim()});
+        toast('Geri bildirim güncellendi.');
+      }
+      await refreshSnapshot();
+    }catch(err){toast(err.message,true)}
+  });
 }
 function feedbackItem(i){
-  const categoryLabels={technical:'Teknik sorun',payment:'Ödeme sorunu',server:'Sunucu / bağlantı',other:'Diğer'};
+  const categoryLabels={technical:'Teknik sorun',payment:'Ödeme sorunu',server:'Sunucu / bağlantı',feedback:'Ürün / özellik geri bildirimi',other:'Diğer'};
   const attachment=i.attachmentBase64?`<div style="margin:12px 0"><img class="image-preview" src="data:${escapeHtml(i.attachmentMime||'image/jpeg')};base64,${i.attachmentBase64}" alt="${escapeHtml(i.attachmentName||'Destek görseli')}"><p class="muted">${escapeHtml(i.attachmentName||'Görsel eki')}</p></div>`:'';
-  return `<article class="card" data-feedback-card="${escapeHtml(i.id)}"><div class="list-item-head"><div><h3>${escapeHtml(i.title||'Destek talebi')}</h3><span class="badge code">${escapeHtml(i.from||'UNKNOWN')}</span> <span class="badge ${i.priority==='premium'?'warn':'ok'}">${i.priority==='premium'?'ÖNCELİKLİ':'NORMAL'}</span> <span class="badge">${escapeHtml(categoryLabels[i.category]||'Teknik sorun')}</span></div><span class="muted">${escapeHtml(fmtDate(i.updatedAt||i.time))}</span></div><p class="muted">${escapeHtml(i.email||'E-posta yok')}</p><p>${escapeHtml(i.body||'')}</p>${attachment}<div class="form-grid"><label><span>Durum</span><select><option value="new" ${i.status==='new'?'selected':''}>Yeni</option><option value="reviewing" ${i.status==='reviewing'?'selected':''}>İnceleniyor</option><option value="resolved" ${i.status==='resolved'?'selected':''}>Çözüldü</option><option value="closed" ${i.status==='closed'?'selected':''}>Kapalı</option></select></label><label class="full"><span>Yanıt</span><textarea>${escapeHtml(i.reply||'')}</textarea></label><button class="primary full" data-feedback="${escapeHtml(i.id)}">Kaydet ve kullanıcıya gönder</button></div></article>`;
+  const rewardBadge=i.category==='feedback'?` <span class="badge ${i.rewardStatus==='rewarded'?'ok':'warn'}">${i.rewardStatus==='rewarded'?'+50 RFX VERİLDİ':'ÖDÜL: '+escapeHtml(i.rewardStatus||'BEKLİYOR')}</span>`:'';
+  const decisionButtons=i.category==='feedback'?`<div class="actions full"><button class="primary" data-feedback-decision="reward" ${i.rewardStatus==='rewarded'?'disabled':''}>Onayla ve 50 RFX Ver</button><button class="ghost" data-feedback-decision="approve">Onayla, Ödül Verme</button><button class="ghost" data-feedback-decision="more_info">Daha Fazla Bilgi İste</button><button class="danger ghost" data-feedback-decision="reject">Reddet</button></div>`:'';
+  return `<article class="card" data-feedback-card="${escapeHtml(i.id)}"><div class="list-item-head"><div><h3>${escapeHtml(i.title||'Destek talebi')}</h3><span class="badge code">${escapeHtml(i.from||'UNKNOWN')}</span> <span class="badge ${i.priority==='premium'?'warn':'ok'}">${i.priority==='premium'?'ÖNCELİKLİ':'NORMAL'}</span> <span class="badge">${escapeHtml(categoryLabels[i.category]||'Teknik sorun')}</span>${rewardBadge}</div><span class="muted">${escapeHtml(fmtDate(i.updatedAt||i.time))}</span></div><p class="muted">${escapeHtml(i.email||'E-posta yok')}</p><p>${escapeHtml(i.body||'')}</p>${attachment}<div class="form-grid"><label><span>Durum</span><select><option value="new" ${i.status==='new'?'selected':''}>Yeni</option><option value="reviewing" ${i.status==='reviewing'?'selected':''}>İnceleniyor</option><option value="resolved" ${i.status==='resolved'?'selected':''}>Çözüldü</option><option value="closed" ${i.status==='closed'?'selected':''}>Kapalı</option></select></label><label class="full"><span>Yanıt</span><textarea>${escapeHtml(i.reply||'')}</textarea></label><button class="primary full" data-feedback="${escapeHtml(i.id)}">Kaydet ve kullanıcıya gönder</button>${decisionButtons}</div></article>`;
 }
 
 function renderSecurity() {
